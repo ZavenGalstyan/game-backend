@@ -52,8 +52,62 @@ const DEFAULT_UNLOCKED_CHARACTERS = [
   "nano_rat","mini_bee","tank_commander","blade_dancer","frost_walker","volt_runner",
 ];
 
-const NEX_ADD_REASONS  = ["game_session", "bonus", "admin"];
-const XP_PER_LEVEL     = 1000; // flat for both account and battle pass
+const NEX_ADD_REASONS = ["game_session", "bonus", "admin"];
+const XP_PER_LEVEL    = 1000; // flat for both account and battle pass
+
+const SHOP_CATALOG = {
+  characters: [
+    { id: "timebreaker",   name: "TIMEBREAKER",   lore: "Bend time.",              price: 15000, color: "#FFDD00" },
+    { id: "ai_avatar",     name: "AI AVATAR",     lore: "Digital consciousness.",  price: 18000, color: "#00FFFF" },
+    { id: "overlord",      name: "THE OVERLORD",  lore: "Commands all.",           price: 20000, color: "#FF0000" },
+    { id: "electric_eel",  name: "ELECTRIC EEL",  lore: "Shock and awe.",          price: 16000, color: "#FFFF00" },
+    { id: "shadow_lord",   name: "SHADOW LORD",   lore: "From the darkness.",      price: 22000, color: "#9900FF" },
+    { id: "plasma_titan",  name: "PLASMA TITAN",  lore: "Unstoppable force.",      price: 25000, color: "#FF6600" },
+    { id: "quantum_ghost", name: "QUANTUM GHOST", lore: "Phase through walls.",    price: 28000, color: "#00FF99" },
+    { id: "omega_prime",   name: "OMEGA PRIME",   lore: "The final form.",         price: 50000, color: "#FF00FF" },
+  ],
+  weapons: [
+    { id: "knife",         name: "COMBAT KNIFE",    desc: "Silent and deadly",        price: 800,  damage: 35,  fireRate: 400,  color: "#AAAAAA" },
+    { id: "smg",           name: "SMG",             desc: "High fire rate",           price: 1200, damage: 12,  fireRate: 100,  color: "#AAAAAA" },
+    { id: "burst",         name: "BURST PISTOL",    desc: "3-round burst",            price: 1500, damage: 18,  fireRate: 350,  color: "#AAAAAA" },
+    { id: "shotgun",       name: "SHOTGUN",         desc: "6 pellets per blast",      price: 1800, damage: 22,  fireRate: 750,  color: "#FF8800" },
+    { id: "assault",       name: "ASSAULT RIFLE",   desc: "Versatile automatic",      price: 2200, damage: 20,  fireRate: 150,  color: "#AAAAAA" },
+    { id: "crossbow",      name: "CROSSBOW",        desc: "Silent, piercing bolts",   price: 2800, damage: 45,  fireRate: 800,  color: "#AAAAAA" },
+    { id: "flamethrower",  name: "FLAMETHROWER",    desc: "Area denial weapon",       price: 3200, damage: 15,  fireRate: 80,   color: "#FF4400" },
+    { id: "sniper",        name: "SNIPER RIFLE",    desc: "One shot, one kill",       price: 3500, damage: 95,  fireRate: 1800, color: "#AAAAAA" },
+    { id: "electricwhip",  name: "ELEC. WHIP",      desc: "Chains to nearby enemies", price: 5500, damage: 40,  fireRate: 600,  color: "#FFFF00" },
+    { id: "minigun",       name: "MINIGUN",         desc: "Suppression fire",         price: 6000, damage: 18,  fireRate: 80,   color: "#AAAAAA" },
+    { id: "gravitgun",     name: "GRAVITY RIFLE",   desc: "Pulls enemies in",         price: 6500, damage: 55,  fireRate: 1200, color: "#9900FF" },
+    { id: "plasmashotgun", name: "PLASMA SHOTGUN",  desc: "Plasma burst spread",      price: 7000, damage: 38,  fireRate: 700,  color: "#00FFCC" },
+    { id: "rocket",        name: "ROCKET LAUNCHER", desc: "Explosive area damage",    price: 7800, damage: 120, fireRate: 2500, color: "#FF2200" },
+    { id: "timecannon",    name: "TIME CANNON",     desc: "Slows enemies on hit",     price: 8000, damage: 70,  fireRate: 1500, color: "#FFDD00" },
+  ],
+  upgrades: [
+    { id: "health",   name: "MAX HEALTH",   desc: "+20 HP per level",       price: 400,  maxLevel: 5, color: "#FF4444" },
+    { id: "speed",    name: "SPEED",        desc: "+18 SPD per level",      price: 500,  maxLevel: 5, color: "#44EEFF" },
+    { id: "damage",   name: "DAMAGE",       desc: "+10% DMG per level",     price: 600,  maxLevel: 5, color: "#FF8800" },
+    { id: "ammo",     name: "AMMO CAP",     desc: "+25% ammo per level",    price: 600,  maxLevel: 5, color: "#AAAAFF" },
+    { id: "firerate", name: "FIRE RATE",    desc: "+10% speed per level",   price: 700,  maxLevel: 5, color: "#FFFF44" },
+    { id: "wealth",   name: "WEALTH",       desc: "+15% NEX per level",     price: 750,  maxLevel: 5, color: "#FFD700" },
+    { id: "armor",    name: "ARMOR",        desc: "-10% dmg taken/level",   price: 800,  maxLevel: 5, color: "#8888AA" },
+    { id: "critical", name: "CRITICAL HIT", desc: "+8% crit chance/level",  price: 800,  maxLevel: 5, color: "#FF44FF" },
+    { id: "leech",    name: "LIFE LEECH",   desc: "+5% HP on kill/level",   price: 850,  maxLevel: 5, color: "#FF0044" },
+    { id: "dodge",    name: "DODGE",        desc: "+6% dodge chance/level", price: 900,  maxLevel: 5, color: "#44FF88" },
+    { id: "regen",    name: "REGEN",        desc: "+2 HP/sec per level",    price: 1000, maxLevel: 5, color: "#00FF44" },
+  ],
+  vehicles: [
+    { id: "sedan",  name: "SEDAN",      desc: "Reliable street car.", price: 2000, speed: 295, hp: 200, color: "#CC3333" },
+    { id: "van",    name: "VAN",        desc: "Heavy and durable.",   price: 4000, speed: 240, hp: 400, color: "#888888" },
+    { id: "suv",    name: "SUV",        desc: "Off-road capable.",    price: 5000, speed: 270, hp: 350, color: "#336699" },
+    { id: "sports", name: "SPORTS CAR", desc: "Maximum speed.",       price: 8000, speed: 380, hp: 180, color: "#FF2244" },
+  ],
+};
+
+// Flat lookup: category:id → price  (e.g. "weapons:shotgun" → 1800)
+const CATALOG_PRICE_MAP = {};
+for (const [cat, items] of Object.entries(SHOP_CATALOG)) {
+  for (const item of items) CATALOG_PRICE_MAP[`${cat}:${item.id}`] = item.price;
+}
 
 // ─── XP & Level Helpers ───────────────────────────────────
 
@@ -148,6 +202,12 @@ const UserSchema = new mongoose.Schema({
   unlockedCharacters:  { type: [String], default: () => [...DEFAULT_UNLOCKED_CHARACTERS] },
   inventory:           { type: InventorySchema, default: () => ({}) },
   stats:               { type: StatsSchema,     default: () => ({}) },
+  purchaseHistory: [{
+    itemId:      { type: String, required: true },
+    category:    { type: String, required: true },
+    price:       { type: Number, required: true },
+    purchasedAt: { type: Date,   default: Date.now },
+  }],
 }, { timestamps: true });
 
 // Auto-recalculate level fields before every save
@@ -637,6 +697,119 @@ app.post("/nex/spend", auth, async (req, res) => {
   await user.save();
 
   res.json({ nex: user.nex });
+});
+
+// ─── Shop ─────────────────────────────────────────────────
+
+/**
+ * @swagger
+ * /shop/catalog:
+ *   get:
+ *     summary: All purchasable items with server-authoritative prices (public)
+ *     tags: [Shop]
+ *     responses:
+ *       200:
+ *         description: Full shop catalog
+ */
+app.get("/shop/catalog", (req, res) => {
+  res.json(SHOP_CATALOG);
+});
+
+/**
+ * @swagger
+ * /shop/inventory:
+ *   get:
+ *     summary: Full inventory + NEX balance in one call
+ *     tags: [Shop]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Inventory and balance
+ */
+app.get("/shop/inventory", auth, async (req, res) => {
+  const user = await User.findById(req.user.id, { nex: 1, unlockedCharacters: 1, inventory: 1 });
+  if (!user) return res.status(404).json({ error: "NOT_FOUND", message: "User not found" });
+
+  res.json({
+    nex:        user.nex,
+    characters: user.unlockedCharacters,
+    weapons:    user.inventory.weapons,
+    upgrades:   user.inventory.upgrades,
+    vehicles:   user.inventory.vehicles,
+    grenades:   user.inventory.grenades,
+  });
+});
+
+/**
+ * @swagger
+ * /shop/buy:
+ *   post:
+ *     summary: Buy an item — atomic NEX deduct + inventory unlock
+ *     tags: [Shop]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [itemId, category]
+ *             properties:
+ *               itemId:   { type: string, example: shotgun }
+ *               category: { type: string, enum: [characters, weapons, upgrades, vehicles], example: weapons }
+ *     responses:
+ *       200:
+ *         description: Purchase successful
+ *       400:
+ *         description: Insufficient NEX, already owned, or invalid item/category
+ */
+app.post("/shop/buy", auth, async (req, res) => {
+  const { itemId, category } = req.body;
+  const VALID_CATEGORIES = ["characters", "weapons", "upgrades", "vehicles"];
+
+  if (!itemId || !category)
+    return res.status(400).json({ error: "MISSING_FIELDS", message: "itemId and category are required" });
+
+  if (!VALID_CATEGORIES.includes(category))
+    return res.status(400).json({ error: "INVALID_CATEGORY", message: "category must be: characters, weapons, upgrades, or vehicles" });
+
+  const price = CATALOG_PRICE_MAP[`${category}:${itemId}`];
+  if (price === undefined)
+    return res.status(400).json({ error: "ITEM_NOT_FOUND", message: "Item does not exist in the catalog" });
+
+  const user = await User.findById(req.user.id);
+  if (!user) return res.status(404).json({ error: "NOT_FOUND", message: "User not found" });
+
+  // Check already owned
+  const owned = category === "characters"
+    ? user.unlockedCharacters.includes(itemId)
+    : user.inventory[category].includes(itemId);
+
+  if (owned)
+    return res.status(400).json({ error: "ALREADY_OWNED", message: "Item already owned" });
+
+  if (user.nex < price)
+    return res.status(400).json({ error: "INSUFFICIENT_NEX", message: "Not enough NEX balance" });
+
+  // Atomic update: deduct NEX, add item, log purchase
+  user.nex -= price;
+  if (category === "characters") {
+    user.unlockedCharacters.push(itemId);
+  } else {
+    user.inventory[category].push(itemId);
+  }
+  user.purchaseHistory.push({ itemId, category, price });
+  await user.save();
+
+  res.json({
+    message:    "Purchase successful",
+    itemId,
+    category,
+    pricePaid:  price,
+    nexBalance: user.nex,
+  });
 });
 
 // ─── 6. Game Session ──────────────────────────────────────
