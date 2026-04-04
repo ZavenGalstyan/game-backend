@@ -100,6 +100,7 @@ function calcBpProgressInfo(bpXp) {
   }
 }
 
+// Comment
 function calcLevel(xp) {
   return calcProgressInfo(xp).level;
 }
