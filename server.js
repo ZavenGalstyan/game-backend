@@ -1,9 +1,11 @@
-const express = require("express");
-const mongoose = require("mongoose");
-const cors = require("cors");
-const bcrypt = require("bcrypt");
-const jwt = require("jsonwebtoken");
-const swaggerUi = require("swagger-ui-express");
+const http      = require("http");
+const express   = require("express");
+const mongoose  = require("mongoose");
+const cors      = require("cors");
+const bcrypt    = require("bcrypt");
+const jwt       = require("jsonwebtoken");
+const WebSocket = require("ws");
+const swaggerUi   = require("swagger-ui-express");
 const swaggerJsdoc = require("swagger-jsdoc");
 
 const app = express();
@@ -202,6 +204,10 @@ const UserSchema = new mongoose.Schema({
   unlockedCharacters:  { type: [String], default: () => [...DEFAULT_UNLOCKED_CHARACTERS] },
   inventory:           { type: InventorySchema, default: () => ({}) },
   stats:               { type: StatsSchema,     default: () => ({}) },
+  // Social
+  friends:   [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
+  clanId:    { type: mongoose.Schema.Types.ObjectId, ref: "Clan", default: null },
+  onlineAt:  { type: Date, default: null },
   purchaseHistory: [{
     itemId:      { type: String, required: true },
     category:    { type: String, required: true },
@@ -252,6 +258,88 @@ const TokenBlacklistSchema = new mongoose.Schema({
 TokenBlacklistSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 const TokenBlacklist = mongoose.model("TokenBlacklist", TokenBlacklistSchema);
 
+// ─── Social Models ────────────────────────────────────────
+
+const FriendRequestSchema = new mongoose.Schema({
+  fromId:   { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+  fromName: { type: String, required: true },
+  toId:     { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+  toName:   { type: String, required: true },
+  status:   { type: String, enum: ["pending", "accepted", "rejected"], default: "pending" },
+}, { timestamps: true });
+
+const FriendRequest = mongoose.model("FriendRequest", FriendRequestSchema);
+
+const DirectMessageSchema = new mongoose.Schema({
+  conversationId: { type: String, required: true, index: true },
+  fromId:   { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+  fromName: { type: String, required: true },
+  toId:     { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+  content:  { type: String, required: true, maxlength: 500 },
+  readAt:   { type: Date, default: null },
+  deleted:  { type: Boolean, default: false },
+}, { timestamps: true });
+
+const DirectMessage = mongoose.model("DirectMessage", DirectMessageSchema);
+
+const ClanMemberSubSchema = new mongoose.Schema({
+  userId:   { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+  name:     { type: String, required: true },
+  role:     { type: String, enum: ["leader", "officer", "member"], default: "member" },
+  joinedAt: { type: Date, default: Date.now },
+}, { _id: false });
+
+const ClanSchema = new mongoose.Schema({
+  name:        { type: String, required: true, unique: true },
+  tag:         { type: String, required: true, unique: true },
+  description: { type: String, default: "", maxlength: 200 },
+  leaderId:    { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+  leaderName:  { type: String, required: true },
+  members:     { type: [ClanMemberSubSchema], default: [] },
+  emblem:      { type: String, default: "⭐" },
+  isOpen:      { type: Boolean, default: false },
+  totalKills:  { type: Number, default: 0 },
+}, { timestamps: true });
+
+ClanSchema.virtual("memberCount").get(function () { return this.members.length; });
+ClanSchema.set("toJSON", { virtuals: true });
+
+const Clan = mongoose.model("Clan", ClanSchema);
+
+const ClanInviteSchema = new mongoose.Schema({
+  clanId:    { type: mongoose.Schema.Types.ObjectId, ref: "Clan", required: true },
+  clanName:  { type: String, required: true },
+  clanTag:   { type: String, required: true },
+  fromId:    { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+  fromName:  { type: String, required: true },
+  toId:      { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+  status:    { type: String, enum: ["pending", "accepted", "rejected", "expired"], default: "pending" },
+  expiresAt: { type: Date, default: () => new Date(Date.now() + 48 * 60 * 60 * 1000) },
+}, { timestamps: true });
+
+const ClanInvite = mongoose.model("ClanInvite", ClanInviteSchema);
+
+const ClanMessageSchema = new mongoose.Schema({
+  clanId:   { type: mongoose.Schema.Types.ObjectId, ref: "Clan", required: true },
+  fromId:   { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+  fromName: { type: String, required: true },
+  fromRole: { type: String, enum: ["leader", "officer", "member"], required: true },
+  content:  { type: String, required: true, maxlength: 500 },
+}, { timestamps: true });
+
+const ClanMessage = mongoose.model("ClanMessage", ClanMessageSchema);
+
+const NotificationSchema = new mongoose.Schema({
+  userId:  { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
+  type:    { type: String, enum: ["friend_request", "friend_accepted", "clan_invite", "clan_kick", "dm_received"], required: true },
+  title:   { type: String, required: true },
+  body:    { type: String, required: true },
+  payload: { type: mongoose.Schema.Types.Mixed, default: {} },
+  readAt:  { type: Date, default: null },
+}, { timestamps: true });
+
+const Notification = mongoose.model("Notification", NotificationSchema);
+
 // ─── Auth Middleware ───────────────────────────────────────
 
 async function auth(req, res, next) {
@@ -270,6 +358,101 @@ async function auth(req, res, next) {
   } catch {
     return res.status(401).json({ error: "UNAUTHORIZED", message: "Invalid or expired token" });
   }
+}
+
+// ─── HTTP Server + WebSocket ──────────────────────────────
+
+const server = http.createServer(app);
+const wss    = new WebSocket.Server({ server });
+
+// userId (string) → WebSocket
+const wsConnections = new Map();
+
+wss.on("connection", async (ws, req) => {
+  const token = new URL(req.url, "http://localhost").searchParams.get("token");
+  let userId;
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    if (await TokenBlacklist.exists({ token })) throw new Error();
+    userId = payload.id.toString();
+  } catch {
+    ws.close(4001, "Invalid token");
+    return;
+  }
+
+  wsConnections.set(userId, ws);
+
+  // Update online status on connect
+  await User.findByIdAndUpdate(userId, { onlineAt: new Date() });
+
+  ws.on("message", async (raw) => {
+    try {
+      const msg = JSON.parse(raw);
+      if (msg.type === "ping")       return ws.send(JSON.stringify({ type: "pong" }));
+      if (msg.type === "heartbeat")  return User.findByIdAndUpdate(userId, { onlineAt: new Date() });
+    } catch { /* ignore malformed */ }
+  });
+
+  ws.on("close", async () => {
+    wsConnections.delete(userId);
+  });
+});
+
+// Push a JSON event to a connected user (no-op if offline)
+function pushToUser(userId, data) {
+  const ws = wsConnections.get(userId.toString());
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(data));
+}
+
+// ─── Social Helpers ───────────────────────────────────────
+
+// Online = heartbeat received within last 2 minutes
+function isUserOnline(onlineAt) {
+  return onlineAt && Date.now() - new Date(onlineAt).getTime() < 2 * 60 * 1000;
+}
+
+// conversationId: deterministic from two user IDs
+function makeConversationId(a, b) {
+  return [a.toString(), b.toString()].sort().join("_");
+}
+
+async function createNotification(userId, type, title, body, payload = {}) {
+  const notif = await Notification.create({ userId, type, title, body, payload });
+  pushToUser(userId, { type: "notification", payload: { notification: notif } });
+  return notif;
+}
+
+// In-memory simple rate limiter
+const _rateBuckets = new Map();
+function rateLimit(userId, action, max, windowMs) {
+  const key  = `${userId}:${action}`;
+  const now  = Date.now();
+  const slot = _rateBuckets.get(key);
+  if (!slot || now > slot.resetAt) {
+    _rateBuckets.set(key, { count: 1, resetAt: now + windowMs });
+    return true;
+  }
+  if (slot.count >= max) return false;
+  slot.count++;
+  return true;
+}
+
+// Serialize a friend entry for response
+async function serializeFriend(friendUser, viewerClanId) {
+  let clanTag = null;
+  if (friendUser.clanId) {
+    const c = await Clan.findById(friendUser.clanId, { tag: 1 });
+    if (c) clanTag = c.tag;
+  }
+  return {
+    id:      friendUser._id,
+    name:    friendUser.name,
+    account: { level: friendUser.level },
+    clanId:  friendUser.clanId || null,
+    clanTag,
+    isOnline: isUserOnline(friendUser.onlineAt),
+    lastSeen: friendUser.onlineAt,
+  };
 }
 
 // ─── Profile Builder ──────────────────────────────────────
@@ -298,6 +481,23 @@ function buildProfile(user) {
     },
     unlockedCharacters: user.unlockedCharacters,
     createdAt: user.createdAt,
+  };
+}
+
+async function resolveSocialFields(user) {
+  let clanId = null, clanName = null, clanTag = null, clanRole = null;
+  if (user.clanId) {
+    const clan = await Clan.findById(user.clanId, { name: 1, tag: 1, members: 1 });
+    if (clan) {
+      const member = clan.members.find(m => m.userId.toString() === user._id.toString());
+      clanId = clan._id; clanName = clan.name; clanTag = clan.tag;
+      clanRole = member?.role || null;
+    }
+  }
+  return {
+    clanId, clanName, clanTag, clanRole,
+    friendCount: user.friends?.length || 0,
+    isOnline:    isUserOnline(user.onlineAt),
   };
 }
 
@@ -464,7 +664,9 @@ app.get("/auth/users", auth, async (req, res) => {
 app.get("/profile/me", auth, async (req, res) => {
   const user = await User.findById(req.user.id);
   if (!user) return res.status(404).json({ error: "NOT_FOUND", message: "User not found" });
-  res.json(buildProfile(user));
+
+  const social = await resolveSocialFields(user);
+  res.json({ ...buildProfile(user), ...social });
 });
 
 /**
@@ -489,7 +691,9 @@ app.get("/profile/me", auth, async (req, res) => {
 app.get("/profile/:name", async (req, res) => {
   const user = await User.findOne({ name: req.params.name });
   if (!user) return res.status(404).json({ error: "NOT_FOUND", message: "User not found" });
-  res.json(buildProfile(user));
+
+  const social = await resolveSocialFields(user);
+  res.json({ ...buildProfile(user), ...social });
 });
 
 // ─── 3. Account XP ────────────────────────────────────────
@@ -905,6 +1109,11 @@ app.post("/session/save", auth, async (req, res) => {
     bossKills, mode, weaponsUsed, vehiclesUsed,
     grenadesThrown, distanceTravelled, xpEarned, nexEarned: moneyEarned,
   });
+
+  // Update clan total kills
+  if (user.clanId && kills > 0) {
+    await Clan.findByIdAndUpdate(user.clanId, { $inc: { totalKills: kills } });
+  }
 
   const accountProgress = calcProgress(user.xp);
   const bpProgress      = calcProgress(user.bpXp);
@@ -1379,6 +1588,1278 @@ app.get("/stats/global", async (req, res) => {
   });
 });
 
+// ─── Friends ──────────────────────────────────────────────
+
+/**
+ * @swagger
+ * /friends/request:
+ *   post:
+ *     summary: Send a friend request
+ *     tags: [Friends]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [targetName]
+ *             properties:
+ *               targetName: { type: string, example: PlayerTwo }
+ *     responses:
+ *       201: { description: Friend request sent }
+ *       400: { description: Cannot add yourself }
+ *       404: { description: User not found }
+ *       409: { description: Already friends or request exists }
+ */
+app.post("/friends/request", auth, async (req, res) => {
+  const { targetName } = req.body;
+  if (!targetName) return res.status(400).json({ message: "targetName is required" });
+
+  if (!rateLimit(req.user.id, "friend_request", 10, 60 * 60 * 1000))
+    return res.status(429).json({ message: "Too many friend requests. Try again later." });
+
+  const [me, target] = await Promise.all([
+    User.findById(req.user.id),
+    User.findOne({ name: targetName }),
+  ]);
+  if (!target) return res.status(404).json({ message: "User not found" });
+  if (target._id.equals(me._id)) return res.status(400).json({ message: "Cannot add yourself" });
+  if (me.friends.some(f => f.equals(target._id))) return res.status(409).json({ message: "Already friends" });
+
+  const existing = await FriendRequest.findOne({
+    status: "pending",
+    $or: [
+      { fromId: me._id, toId: target._id },
+      { fromId: target._id, toId: me._id },
+    ],
+  });
+  if (existing) return res.status(409).json({ message: "Friend request already exists" });
+
+  const request = await FriendRequest.create({ fromId: me._id, fromName: me.name, toId: target._id, toName: target.name });
+
+  await createNotification(target._id, "friend_request", "Friend Request", `${me.name} sent you a friend request.`, { requestId: request._id, fromName: me.name });
+  pushToUser(target._id, { type: "friend_request_received", payload: { request } });
+
+  res.status(201).json({ message: "Friend request sent", request });
+});
+
+/**
+ * @swagger
+ * /friends/requests/incoming:
+ *   get:
+ *     summary: Get all pending friend requests sent TO you
+ *     tags: [Friends]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200: { description: List of incoming requests }
+ */
+app.get("/friends/requests/incoming", auth, async (req, res) => {
+  const requests = await FriendRequest.find({ toId: req.user.id, status: "pending" }).sort({ createdAt: -1 });
+  res.json({ requests });
+});
+
+/**
+ * @swagger
+ * /friends/requests/outgoing:
+ *   get:
+ *     summary: Get all pending friend requests sent BY you
+ *     tags: [Friends]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200: { description: List of outgoing requests }
+ */
+app.get("/friends/requests/outgoing", auth, async (req, res) => {
+  const requests = await FriendRequest.find({ fromId: req.user.id, status: "pending" }).sort({ createdAt: -1 });
+  res.json({ requests });
+});
+
+/**
+ * @swagger
+ * /friends/request/{requestId}/accept:
+ *   post:
+ *     summary: Accept an incoming friend request
+ *     tags: [Friends]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: requestId
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200: { description: Friend request accepted }
+ *       403: { description: Not the recipient }
+ *       404: { description: Request not found }
+ */
+app.post("/friends/request/:requestId/accept", auth, async (req, res) => {
+  const request = await FriendRequest.findById(req.params.requestId);
+  if (!request) return res.status(404).json({ message: "Request not found" });
+  if (!request.toId.equals(req.user.id)) return res.status(403).json({ message: "Not the recipient" });
+  if (request.status !== "pending") return res.status(409).json({ message: "Request already processed" });
+
+  request.status = "accepted";
+  await request.save();
+
+  await Promise.all([
+    User.findByIdAndUpdate(request.fromId, { $addToSet: { friends: request.toId } }),
+    User.findByIdAndUpdate(request.toId,   { $addToSet: { friends: request.fromId } }),
+  ]);
+
+  const [friendUser] = await Promise.all([
+    User.findById(request.fromId),
+    createNotification(request.fromId, "friend_accepted", "Friend Request Accepted", `${request.toName} accepted your friend request.`, { name: request.toName }),
+  ]);
+  const friend = await serializeFriend(friendUser);
+  pushToUser(request.fromId, { type: "friend_accepted", payload: { friend } });
+
+  res.json({ message: "Friend request accepted", friend });
+});
+
+/**
+ * @swagger
+ * /friends/request/{requestId}/reject:
+ *   post:
+ *     summary: Reject an incoming friend request
+ *     tags: [Friends]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: requestId
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200: { description: Request rejected }
+ */
+app.post("/friends/request/:requestId/reject", auth, async (req, res) => {
+  const request = await FriendRequest.findById(req.params.requestId);
+  if (!request) return res.status(404).json({ message: "Request not found" });
+  if (!request.toId.equals(req.user.id)) return res.status(403).json({ message: "Not the recipient" });
+  if (request.status !== "pending") return res.status(409).json({ message: "Request already processed" });
+
+  request.status = "rejected";
+  await request.save();
+  res.json({ message: "Friend request rejected" });
+});
+
+/**
+ * @swagger
+ * /friends/request/{requestId}:
+ *   delete:
+ *     summary: Cancel a friend request you sent
+ *     tags: [Friends]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: requestId
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200: { description: Request cancelled }
+ *       403: { description: Not the sender }
+ */
+app.delete("/friends/request/:requestId", auth, async (req, res) => {
+  const request = await FriendRequest.findById(req.params.requestId);
+  if (!request) return res.status(404).json({ message: "Request not found" });
+  if (!request.fromId.equals(req.user.id)) return res.status(403).json({ message: "Not the sender" });
+  if (request.status !== "pending") return res.status(409).json({ message: "Request already processed" });
+
+  await request.deleteOne();
+  res.json({ message: "Friend request cancelled" });
+});
+
+/**
+ * @swagger
+ * /friends:
+ *   get:
+ *     summary: Get your full friends list with online status
+ *     tags: [Friends]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200: { description: Friends list }
+ */
+app.get("/friends", auth, async (req, res) => {
+  const me = await User.findById(req.user.id, { friends: 1 });
+  const friendUsers = await User.find({ _id: { $in: me.friends } }, { name: 1, level: 1, clanId: 1, onlineAt: 1 });
+  const friends = await Promise.all(friendUsers.map(f => serializeFriend(f)));
+  res.json({ friends, total: friends.length });
+});
+
+/**
+ * @swagger
+ * /friends/{friendName}:
+ *   delete:
+ *     summary: Remove a friend
+ *     tags: [Friends]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: friendName
+ *         required: true
+ *         schema: { type: string }
+ *         example: PlayerTwo
+ *     responses:
+ *       200: { description: Friend removed }
+ *       404: { description: Not in friend list }
+ */
+app.delete("/friends/:friendName", auth, async (req, res) => {
+  const [me, friend] = await Promise.all([
+    User.findById(req.user.id),
+    User.findOne({ name: req.params.friendName }),
+  ]);
+  if (!friend) return res.status(404).json({ message: "User not found" });
+  if (!me.friends.some(f => f.equals(friend._id))) return res.status(404).json({ message: "Not in friend list" });
+
+  await Promise.all([
+    User.findByIdAndUpdate(me._id,     { $pull: { friends: friend._id } }),
+    User.findByIdAndUpdate(friend._id, { $pull: { friends: me._id } }),
+  ]);
+  res.json({ message: "Friend removed" });
+});
+
+/**
+ * @swagger
+ * /friends/online:
+ *   get:
+ *     summary: Get only online friends
+ *     tags: [Friends]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200: { description: Online friends }
+ */
+app.get("/friends/online", auth, async (req, res) => {
+  const me = await User.findById(req.user.id, { friends: 1 });
+  const friendUsers = await User.find({ _id: { $in: me.friends } }, { name: 1, level: 1, clanId: 1, onlineAt: 1 });
+  const online = (await Promise.all(friendUsers.map(f => serializeFriend(f)))).filter(f => f.isOnline);
+  res.json({ online, count: online.length });
+});
+
+/**
+ * @swagger
+ * /friends/heartbeat:
+ *   post:
+ *     summary: Keep your online status alive (call every 30s)
+ *     tags: [Friends]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200: { description: OK }
+ */
+app.post("/friends/heartbeat", auth, async (req, res) => {
+  await User.findByIdAndUpdate(req.user.id, { onlineAt: new Date() });
+  res.json({ ok: true });
+});
+
+// ─── Direct Messages ──────────────────────────────────────
+
+/**
+ * @swagger
+ * /dm/conversations:
+ *   get:
+ *     summary: Get all your conversations sorted by most recent
+ *     tags: [Direct Messages]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200: { description: Conversations list with unread counts }
+ */
+app.get("/dm/conversations", auth, async (req, res) => {
+  const uid = req.user.id.toString();
+  const messages = await DirectMessage.aggregate([
+    { $match: { conversationId: { $regex: uid } } },
+    { $sort: { createdAt: -1 } },
+    { $group: { _id: "$conversationId", lastMessage: { $first: "$$ROOT" }, unread: { $sum: { $cond: [{ $and: [{ $eq: ["$readAt", null] }, { $ne: [{ $toString: "$toId" }, uid] }, { $eq: ["$deleted", false] }] }, 1, 0] } } } },
+    { $sort: { "lastMessage.createdAt": -1 } },
+  ]);
+
+  const totalUnread = messages.reduce((s, m) => s + m.unread, 0);
+  res.json({
+    conversations: messages.map(m => ({
+      id: m._id, lastMessage: m.lastMessage, unreadCount: m.unread,
+    })),
+    totalUnread,
+  });
+});
+
+/**
+ * @swagger
+ * /dm/conversations/{conversationId}/messages:
+ *   get:
+ *     summary: Get messages in a conversation (marks them as read)
+ *     tags: [Direct Messages]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: conversationId
+ *         required: true
+ *         schema: { type: string }
+ *       - in: query
+ *         name: limit
+ *         schema: { type: integer, default: 50 }
+ *       - in: query
+ *         name: before
+ *         schema: { type: string }
+ *         description: messageId cursor for pagination
+ *     responses:
+ *       200: { description: Messages array }
+ *       403: { description: Not a participant }
+ */
+app.get("/dm/conversations/:conversationId/messages", auth, async (req, res) => {
+  const { conversationId } = req.params;
+  const uid = req.user.id.toString();
+  if (!conversationId.includes(uid)) return res.status(403).json({ message: "Not a participant" });
+
+  const limit  = Math.min(parseInt(req.query.limit) || 50, 100);
+  const before = req.query.before;
+  const query  = { conversationId, deleted: false };
+  if (before) {
+    const pivot = await DirectMessage.findById(before);
+    if (pivot) query.createdAt = { $lt: pivot.createdAt };
+  }
+
+  const messages = await DirectMessage.find(query).sort({ createdAt: -1 }).limit(limit + 1);
+  const hasMore  = messages.length > limit;
+  if (hasMore) messages.pop();
+
+  // Mark messages sent to this user as read
+  await DirectMessage.updateMany({ conversationId, toId: req.user.id, readAt: null }, { readAt: new Date() });
+
+  res.json({ messages: messages.reverse(), hasMore });
+});
+
+/**
+ * @swagger
+ * /dm/send:
+ *   post:
+ *     summary: Send a direct message to a friend
+ *     tags: [Direct Messages]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [toName, content]
+ *             properties:
+ *               toName:  { type: string, example: PlayerTwo }
+ *               content: { type: string, example: "gg!" }
+ *     responses:
+ *       201: { description: Message sent }
+ *       400: { description: Not friends or empty content }
+ *       429: { description: Rate limited (20/min) }
+ */
+app.post("/dm/send", auth, async (req, res) => {
+  const { toName, content } = req.body;
+  if (!toName || !content?.trim()) return res.status(400).json({ message: "toName and content are required" });
+  if (content.trim().length > 500)  return res.status(400).json({ message: "Message too long (max 500 chars)" });
+
+  if (!rateLimit(req.user.id, "dm_send", 20, 60 * 1000))
+    return res.status(429).json({ message: "Sending too fast. Slow down." });
+
+  const [me, target] = await Promise.all([
+    User.findById(req.user.id),
+    User.findOne({ name: toName }),
+  ]);
+  if (!target) return res.status(404).json({ message: "User not found" });
+  if (!me.friends.some(f => f.equals(target._id)))
+    return res.status(400).json({ message: "You can only message friends" });
+
+  const conversationId = makeConversationId(me._id, target._id);
+  const message = await DirectMessage.create({
+    conversationId, fromId: me._id, fromName: me.name,
+    toId: target._id, content: content.trim(),
+  });
+
+  await createNotification(target._id, "dm_received", "New Message", `${me.name}: ${content.trim().slice(0, 60)}`, { conversationId, fromName: me.name });
+  pushToUser(target._id, { type: "dm_received", payload: { message, conversationId } });
+
+  res.status(201).json({ message, conversationId });
+});
+
+/**
+ * @swagger
+ * /dm/conversations/{conversationId}/read:
+ *   post:
+ *     summary: Mark all messages in a conversation as read
+ *     tags: [Direct Messages]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: conversationId
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200: { description: Messages marked as read }
+ */
+app.post("/dm/conversations/:conversationId/read", auth, async (req, res) => {
+  const { conversationId } = req.params;
+  const result = await DirectMessage.updateMany({ conversationId, toId: req.user.id, readAt: null }, { readAt: new Date() });
+  res.json({ markedRead: result.modifiedCount });
+});
+
+/**
+ * @swagger
+ * /dm/unread:
+ *   get:
+ *     summary: Get total unread DM count
+ *     tags: [Direct Messages]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200: { description: Unread count }
+ */
+app.get("/dm/unread", auth, async (req, res) => {
+  const unread = await DirectMessage.countDocuments({ toId: req.user.id, readAt: null, deleted: false });
+  res.json({ unread });
+});
+
+/**
+ * @swagger
+ * /dm/messages/{messageId}:
+ *   delete:
+ *     summary: Delete your own message (within 5 minutes)
+ *     tags: [Direct Messages]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: messageId
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200: { description: Message deleted }
+ *       403: { description: Not your message }
+ *       400: { description: Too old to delete }
+ */
+app.delete("/dm/messages/:messageId", auth, async (req, res) => {
+  const msg = await DirectMessage.findById(req.params.messageId);
+  if (!msg) return res.status(404).json({ message: "Message not found" });
+  if (!msg.fromId.equals(req.user.id)) return res.status(403).json({ message: "Can only delete own messages" });
+  if (Date.now() - msg.createdAt.getTime() > 5 * 60 * 1000)
+    return res.status(400).json({ message: "Can only delete messages within 5 minutes of sending" });
+
+  msg.deleted = true;
+  msg.content = "[message deleted]";
+  await msg.save();
+  res.json({ message: "Message deleted" });
+});
+
+// ─── Clans ────────────────────────────────────────────────
+
+/**
+ * @swagger
+ * /clans:
+ *   post:
+ *     summary: Create a new clan
+ *     tags: [Clans]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [name, tag]
+ *             properties:
+ *               name:        { type: string, example: "Neon Crew" }
+ *               tag:         { type: string, example: "NCG" }
+ *               description: { type: string, example: "Top players only." }
+ *               emblem:      { type: string, example: "⚡" }
+ *               isOpen:      { type: boolean, example: false }
+ *     responses:
+ *       201: { description: Clan created }
+ *       409: { description: Already in a clan or name/tag taken }
+ *   get:
+ *     summary: Browse and search clans (public)
+ *     tags: [Clans]
+ *     parameters:
+ *       - in: query
+ *         name: q
+ *         schema: { type: string }
+ *         description: Search by name or tag
+ *       - in: query
+ *         name: page
+ *         schema: { type: integer, default: 1 }
+ *       - in: query
+ *         name: limit
+ *         schema: { type: integer, default: 20 }
+ *       - in: query
+ *         name: sortBy
+ *         schema: { type: string, enum: [members, kills, created], default: members }
+ *     responses:
+ *       200: { description: Clans list }
+ */
+app.post("/clans", auth, async (req, res) => {
+  const { name, tag, description = "", emblem = "⭐", isOpen = false } = req.body;
+  if (!name || !tag) return res.status(400).json({ message: "name and tag are required" });
+  if (name.length < 3 || name.length > 24) return res.status(400).json({ message: "Clan name must be 3–24 characters" });
+  if (!/^[a-zA-Z0-9]{2,5}$/.test(tag))    return res.status(400).json({ message: "Tag must be 2–5 letters/numbers" });
+
+  const me = await User.findById(req.user.id);
+  if (me.clanId) return res.status(409).json({ message: "Already in a clan" });
+
+  const upperTag = tag.toUpperCase();
+  if (await Clan.exists({ $or: [{ name: { $regex: `^${name}$`, $options: "i" } }, { tag: upperTag }] }))
+    return res.status(409).json({ message: "Clan name or tag already taken" });
+
+  const clan = await Clan.create({
+    name, tag: upperTag, description: description.slice(0, 200), leaderId: me._id,
+    leaderName: me.name, emblem, isOpen,
+    members: [{ userId: me._id, name: me.name, role: "leader" }],
+  });
+
+  me.clanId = clan._id;
+  await me.save();
+
+  res.status(201).json({ message: "Clan created", clan });
+});
+
+app.get("/clans", async (req, res) => {
+  const { q, page = 1, limit = 20, sortBy = "members" } = req.query;
+  const filter = q ? { $or: [{ name: { $regex: q, $options: "i" } }, { tag: { $regex: q, $options: "i" } }] } : {};
+  const sortMap = { kills: { totalKills: -1 }, created: { createdAt: -1 }, members: {} };
+  const total = await Clan.countDocuments(filter);
+  let clans   = await Clan.find(filter).skip((page - 1) * Math.min(limit, 50)).limit(Math.min(limit, 50));
+  if (sortBy === "members") clans = clans.sort((a, b) => b.members.length - a.members.length);
+  else if (sortMap[sortBy]) clans = await Clan.find(filter).sort(sortMap[sortBy]).skip((page - 1) * Math.min(limit, 50)).limit(Math.min(limit, 50));
+  res.json({ clans, total, page: Number(page), pages: Math.ceil(total / Math.min(limit, 50)) });
+});
+
+/**
+ * @swagger
+ * /clans/me:
+ *   get:
+ *     summary: Get your own clan with members and pending invites
+ *     tags: [Clans]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200: { description: Your clan info }
+ *       404: { description: Not in a clan }
+ */
+app.get("/clans/me", auth, async (req, res) => {
+  const me = await User.findById(req.user.id);
+  if (!me.clanId) return res.status(404).json({ message: "Not in a clan" });
+
+  const clan = await Clan.findById(me.clanId);
+  if (!clan) return res.status(404).json({ message: "Clan not found" });
+
+  const myMember = clan.members.find(m => m.userId.equals(me._id));
+  let pendingInvites = [];
+  if (["leader", "officer"].includes(myMember?.role)) {
+    pendingInvites = await ClanInvite.find({ clanId: clan._id, status: "pending", expiresAt: { $gt: new Date() } });
+  }
+
+  res.json({ clan, members: clan.members, myRole: myMember?.role || "member", pendingInvites });
+});
+
+/**
+ * @swagger
+ * /clans/invites:
+ *   get:
+ *     summary: Get all pending clan invites sent to you
+ *     tags: [Clans]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200: { description: Pending clan invites }
+ */
+app.get("/clans/invites", auth, async (req, res) => {
+  await ClanInvite.updateMany({ toId: req.user.id, status: "pending", expiresAt: { $lt: new Date() } }, { status: "expired" });
+  const invites = await ClanInvite.find({ toId: req.user.id, status: "pending" });
+  res.json({ invites });
+});
+
+/**
+ * @swagger
+ * /clans/{clanId}:
+ *   get:
+ *     summary: Get public clan info and member list
+ *     tags: [Clans]
+ *     parameters:
+ *       - in: path
+ *         name: clanId
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200: { description: Clan info }
+ *       404: { description: Clan not found }
+ *   patch:
+ *     summary: Update clan description, emblem, or open status (leader/officer only)
+ *     tags: [Clans]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: clanId
+ *         required: true
+ *         schema: { type: string }
+ *     requestBody:
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               description: { type: string }
+ *               emblem:      { type: string }
+ *               isOpen:      { type: boolean }
+ *     responses:
+ *       200: { description: Clan updated }
+ *       403: { description: Insufficient role }
+ *   delete:
+ *     summary: Disband the clan (leader only)
+ *     tags: [Clans]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: clanId
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200: { description: Clan disbanded }
+ *       403: { description: Not the leader }
+ */
+app.get("/clans/:clanId", async (req, res) => {
+  const clan = await Clan.findById(req.params.clanId);
+  if (!clan) return res.status(404).json({ message: "Clan not found" });
+  res.json({ clan, members: clan.members });
+});
+
+app.patch("/clans/:clanId", auth, async (req, res) => {
+  const clan = await Clan.findById(req.params.clanId);
+  if (!clan) return res.status(404).json({ message: "Clan not found" });
+  const member = clan.members.find(m => m.userId.equals(req.user.id));
+  if (!member || !["leader", "officer"].includes(member.role)) return res.status(403).json({ message: "Insufficient role" });
+
+  const { description, emblem, isOpen } = req.body;
+  if (description !== undefined) clan.description = description.slice(0, 200);
+  if (emblem      !== undefined) clan.emblem       = emblem;
+  if (isOpen      !== undefined) clan.isOpen       = isOpen;
+  await clan.save();
+  res.json({ message: "Clan updated", clan });
+});
+
+/**
+ * @swagger
+ * /clans/{clanId}/join:
+ *   post:
+ *     summary: Join an open clan (no invite needed)
+ *     tags: [Clans]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: clanId
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200: { description: Joined clan }
+ *       403: { description: Clan is invite-only }
+ *       400: { description: Already in a clan or clan full }
+ */
+app.post("/clans/:clanId/join", auth, async (req, res) => {
+  const me   = await User.findById(req.user.id);
+  const clan = await Clan.findById(req.params.clanId);
+  if (!clan)     return res.status(404).json({ message: "Clan not found" });
+  if (me.clanId) return res.status(400).json({ message: "Already in a clan" });
+  if (!clan.isOpen) return res.status(403).json({ message: "Clan is invite-only" });
+  if (clan.members.length >= 30) return res.status(400).json({ message: "Clan is full" });
+
+  clan.members.push({ userId: me._id, name: me.name, role: "member" });
+  await clan.save();
+  me.clanId = clan._id;
+  await me.save();
+  res.json({ message: "Joined clan", clan });
+});
+
+/**
+ * @swagger
+ * /clans/leave:
+ *   post:
+ *     summary: Leave your current clan
+ *     tags: [Clans]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200: { description: Left clan }
+ *       409: { description: Leader must transfer or disband first }
+ */
+app.post("/clans/leave", auth, async (req, res) => {
+  const me   = await User.findById(req.user.id);
+  if (!me.clanId) return res.status(400).json({ message: "Not in a clan" });
+  const clan = await Clan.findById(me.clanId);
+  if (!clan) { me.clanId = null; await me.save(); return res.json({ message: "Left clan" }); }
+
+  const member = clan.members.find(m => m.userId.equals(me._id));
+  if (member?.role === "leader") {
+    if (clan.members.length === 1) {
+      await Clan.findByIdAndDelete(clan._id);
+      await User.updateMany({ clanId: clan._id }, { clanId: null });
+      return res.json({ message: "Left clan (clan disbanded — no members remaining)" });
+    }
+    return res.status(409).json({ message: "Transfer leadership or disband before leaving" });
+  }
+
+  clan.members = clan.members.filter(m => !m.userId.equals(me._id));
+  await clan.save();
+  me.clanId = null;
+  await me.save();
+  res.json({ message: "Left clan" });
+});
+
+app.delete("/clans/:clanId", auth, async (req, res) => {
+  const clan = await Clan.findById(req.params.clanId);
+  if (!clan) return res.status(404).json({ message: "Clan not found" });
+  if (!clan.leaderId.equals(req.user.id)) return res.status(403).json({ message: "Only the leader can disband" });
+
+  const memberIds = clan.members.map(m => m.userId);
+  await Promise.all([
+    User.updateMany({ _id: { $in: memberIds } }, { clanId: null }),
+    ClanInvite.deleteMany({ clanId: clan._id }),
+    ClanMessage.deleteMany({ clanId: clan._id }),
+    clan.deleteOne(),
+  ]);
+  res.json({ message: "Clan disbanded" });
+});
+
+/**
+ * @swagger
+ * /clans/{clanId}/invite:
+ *   post:
+ *     summary: Invite a player to the clan (leader/officer only)
+ *     tags: [Clans]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: clanId
+ *         required: true
+ *         schema: { type: string }
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [targetName]
+ *             properties:
+ *               targetName: { type: string, example: PlayerFive }
+ *     responses:
+ *       201: { description: Invitation sent }
+ *       403: { description: Insufficient role }
+ *       409: { description: Invite already exists }
+ */
+app.post("/clans/:clanId/invite", auth, async (req, res) => {
+  const { targetName } = req.body;
+  if (!targetName) return res.status(400).json({ message: "targetName is required" });
+  if (!rateLimit(req.user.id, "clan_invite", 20, 60 * 60 * 1000))
+    return res.status(429).json({ message: "Too many invites" });
+
+  const [clan, target] = await Promise.all([
+    Clan.findById(req.params.clanId),
+    User.findOne({ name: targetName }),
+  ]);
+  if (!clan)   return res.status(404).json({ message: "Clan not found" });
+  if (!target) return res.status(404).json({ message: "User not found" });
+
+  const senderMember = clan.members.find(m => m.userId.equals(req.user.id));
+  if (!senderMember || !["leader", "officer"].includes(senderMember.role))
+    return res.status(403).json({ message: "Insufficient role" });
+
+  if (target.clanId) return res.status(400).json({ message: "Player is already in a clan" });
+  if (clan.members.length >= 30) return res.status(400).json({ message: "Clan is full" });
+
+  const pending = await ClanInvite.countDocuments({ clanId: clan._id, status: "pending", expiresAt: { $gt: new Date() } });
+  if (pending >= 10) return res.status(400).json({ message: "Max 10 pending invites at a time" });
+
+  const dup = await ClanInvite.findOne({ clanId: clan._id, toId: target._id, status: "pending" });
+  if (dup) return res.status(409).json({ message: "Pending invite already exists for this player" });
+
+  const sender = await User.findById(req.user.id, { name: 1 });
+  const invite = await ClanInvite.create({
+    clanId: clan._id, clanName: clan.name, clanTag: clan.tag,
+    fromId: sender._id, fromName: sender.name, toId: target._id,
+  });
+
+  await createNotification(target._id, "clan_invite", "Clan Invite", `${sender.name} invited you to join [${clan.tag}] ${clan.name}.`, { inviteId: invite._id, clanName: clan.name });
+  pushToUser(target._id, { type: "clan_invite_received", payload: { invite } });
+
+  res.status(201).json({ message: "Invitation sent", invite });
+});
+
+/**
+ * @swagger
+ * /clans/invites/{inviteId}/accept:
+ *   post:
+ *     summary: Accept a clan invite
+ *     tags: [Clans]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: inviteId
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200: { description: Joined clan }
+ *       409: { description: Expired, already in clan, or clan full }
+ */
+app.post("/clans/invites/:inviteId/accept", auth, async (req, res) => {
+  await ClanInvite.updateMany({ status: "pending", expiresAt: { $lt: new Date() } }, { status: "expired" });
+  const invite = await ClanInvite.findById(req.params.inviteId);
+  if (!invite) return res.status(404).json({ message: "Invite not found" });
+  if (!invite.toId.equals(req.user.id)) return res.status(403).json({ message: "Not the invitee" });
+  if (invite.status !== "pending") return res.status(409).json({ message: `Invite is ${invite.status}` });
+
+  const [me, clan] = await Promise.all([
+    User.findById(req.user.id),
+    Clan.findById(invite.clanId),
+  ]);
+  if (!clan)    return res.status(404).json({ message: "Clan no longer exists" });
+  if (me.clanId) return res.status(409).json({ message: "Already in a clan" });
+  if (clan.members.length >= 30) return res.status(409).json({ message: "Clan is full" });
+
+  clan.members.push({ userId: me._id, name: me.name, role: "member" });
+  await clan.save();
+  me.clanId = clan._id;
+  await me.save();
+  invite.status = "accepted";
+  await invite.save();
+
+  res.json({ message: "Joined clan", clan });
+});
+
+/**
+ * @swagger
+ * /clans/invites/{inviteId}/reject:
+ *   post:
+ *     summary: Reject a clan invite
+ *     tags: [Clans]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: inviteId
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200: { description: Invite rejected }
+ */
+app.post("/clans/invites/:inviteId/reject", auth, async (req, res) => {
+  const invite = await ClanInvite.findById(req.params.inviteId);
+  if (!invite) return res.status(404).json({ message: "Invite not found" });
+  if (!invite.toId.equals(req.user.id)) return res.status(403).json({ message: "Not the invitee" });
+  invite.status = "rejected";
+  await invite.save();
+  res.json({ message: "Invite rejected" });
+});
+
+/**
+ * @swagger
+ * /clans/{clanId}/members/{targetName}:
+ *   delete:
+ *     summary: Kick a member from the clan
+ *     tags: [Clans]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: clanId
+ *         required: true
+ *         schema: { type: string }
+ *       - in: path
+ *         name: targetName
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200: { description: Member kicked }
+ *       403: { description: Insufficient role }
+ */
+app.delete("/clans/:clanId/members/:targetName", auth, async (req, res) => {
+  const [clan, target] = await Promise.all([
+    Clan.findById(req.params.clanId),
+    User.findOne({ name: req.params.targetName }),
+  ]);
+  if (!clan)   return res.status(404).json({ message: "Clan not found" });
+  if (!target) return res.status(404).json({ message: "User not found" });
+
+  const kicker = clan.members.find(m => m.userId.equals(req.user.id));
+  const victim = clan.members.find(m => m.userId.equals(target._id));
+  if (!kicker || !victim) return res.status(404).json({ message: "Member not found" });
+
+  if (kicker.role === "officer" && victim.role !== "member")
+    return res.status(403).json({ message: "Officers can only kick members" });
+  if (kicker.role === "member")
+    return res.status(403).json({ message: "Insufficient role" });
+  if (victim.userId.equals(req.user.id))
+    return res.status(400).json({ message: "Use /clans/leave to leave" });
+
+  clan.members = clan.members.filter(m => !m.userId.equals(target._id));
+  await clan.save();
+  target.clanId = null;
+  await target.save();
+
+  await createNotification(target._id, "clan_kick", "Kicked from Clan", `You were kicked from [${clan.tag}] ${clan.name}.`, { clanId: clan._id, clanName: clan.name });
+  pushToUser(target._id, { type: "clan_kicked", payload: { clanId: clan._id, clanName: clan.name } });
+
+  res.json({ message: "Member kicked" });
+});
+
+/**
+ * @swagger
+ * /clans/{clanId}/members/{targetName}/promote:
+ *   post:
+ *     summary: Promote a member to officer (leader only)
+ *     tags: [Clans]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: clanId
+ *         required: true
+ *         schema: { type: string }
+ *       - in: path
+ *         name: targetName
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200: { description: Member promoted to officer }
+ *       403: { description: Not leader }
+ */
+app.post("/clans/:clanId/members/:targetName/promote", auth, async (req, res) => {
+  const clan = await Clan.findById(req.params.clanId);
+  if (!clan) return res.status(404).json({ message: "Clan not found" });
+  if (!clan.leaderId.equals(req.user.id)) return res.status(403).json({ message: "Only leader can promote" });
+
+  const member = clan.members.find(m => m.name === req.params.targetName);
+  if (!member) return res.status(404).json({ message: "Member not found" });
+  if (member.role !== "member") return res.status(400).json({ message: "Member is already officer or leader" });
+
+  member.role = "officer";
+  await clan.save();
+  res.json({ message: "Member promoted to officer" });
+});
+
+/**
+ * @swagger
+ * /clans/{clanId}/members/{targetName}/demote:
+ *   post:
+ *     summary: Demote an officer to member (leader only)
+ *     tags: [Clans]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: clanId
+ *         required: true
+ *         schema: { type: string }
+ *       - in: path
+ *         name: targetName
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200: { description: Officer demoted to member }
+ *       403: { description: Not leader }
+ */
+app.post("/clans/:clanId/members/:targetName/demote", auth, async (req, res) => {
+  const clan = await Clan.findById(req.params.clanId);
+  if (!clan) return res.status(404).json({ message: "Clan not found" });
+  if (!clan.leaderId.equals(req.user.id)) return res.status(403).json({ message: "Only leader can demote" });
+
+  const member = clan.members.find(m => m.name === req.params.targetName);
+  if (!member) return res.status(404).json({ message: "Member not found" });
+  if (member.role !== "officer") return res.status(400).json({ message: "Member is not an officer" });
+
+  member.role = "member";
+  await clan.save();
+  res.json({ message: "Officer demoted to member" });
+});
+
+/**
+ * @swagger
+ * /clans/{clanId}/transfer:
+ *   post:
+ *     summary: Transfer leadership to another member (leader only)
+ *     tags: [Clans]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: clanId
+ *         required: true
+ *         schema: { type: string }
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [targetName]
+ *             properties:
+ *               targetName: { type: string, example: PlayerTwo }
+ *     responses:
+ *       200: { description: Leadership transferred }
+ *       403: { description: Not the leader }
+ */
+app.post("/clans/:clanId/transfer", auth, async (req, res) => {
+  const { targetName } = req.body;
+  const clan = await Clan.findById(req.params.clanId);
+  if (!clan) return res.status(404).json({ message: "Clan not found" });
+  if (!clan.leaderId.equals(req.user.id)) return res.status(403).json({ message: "Only the leader can transfer leadership" });
+
+  const newLeaderMember = clan.members.find(m => m.name === targetName);
+  if (!newLeaderMember) return res.status(404).json({ message: "Member not found" });
+
+  const oldLeaderMember = clan.members.find(m => m.userId.equals(req.user.id));
+  newLeaderMember.role = "leader";
+  oldLeaderMember.role = "officer";
+  clan.leaderId    = newLeaderMember.userId;
+  clan.leaderName  = newLeaderMember.name;
+  await clan.save();
+  res.json({ message: "Leadership transferred" });
+});
+
+// ─── Clan Chat ────────────────────────────────────────────
+
+/**
+ * @swagger
+ * /clans/{clanId}/chat:
+ *   get:
+ *     summary: Get clan chat history (members only)
+ *     tags: [Clan Chat]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: clanId
+ *         required: true
+ *         schema: { type: string }
+ *       - in: query
+ *         name: limit
+ *         schema: { type: integer, default: 50 }
+ *       - in: query
+ *         name: before
+ *         schema: { type: string }
+ *         description: messageId cursor for pagination
+ *     responses:
+ *       200: { description: Chat messages }
+ *       403: { description: Not a clan member }
+ *   post:
+ *     summary: Send a message to clan chat (members only, 10/min limit)
+ *     tags: [Clan Chat]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: clanId
+ *         required: true
+ *         schema: { type: string }
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [content]
+ *             properties:
+ *               content: { type: string, example: "gg everyone!" }
+ *     responses:
+ *       201: { description: Message sent }
+ *       403: { description: Not a clan member }
+ *       429: { description: Rate limited }
+ */
+app.get("/clans/:clanId/chat", auth, async (req, res) => {
+  const clan = await Clan.findById(req.params.clanId, { members: 1 });
+  if (!clan) return res.status(404).json({ message: "Clan not found" });
+  if (!clan.members.some(m => m.userId.equals(req.user.id)))
+    return res.status(403).json({ message: "Not a clan member" });
+
+  const limit  = Math.min(parseInt(req.query.limit) || 50, 100);
+  const before = req.query.before;
+  const query  = { clanId: req.params.clanId };
+  if (before) {
+    const pivot = await ClanMessage.findById(before);
+    if (pivot) query.createdAt = { $lt: pivot.createdAt };
+  }
+
+  const messages = await ClanMessage.find(query).sort({ createdAt: -1 }).limit(limit + 1);
+  const hasMore  = messages.length > limit;
+  if (hasMore) messages.pop();
+  res.json({ messages: messages.reverse(), hasMore });
+});
+
+app.post("/clans/:clanId/chat", auth, async (req, res) => {
+  const { content } = req.body;
+  if (!content?.trim())          return res.status(400).json({ message: "content is required" });
+  if (content.trim().length > 500) return res.status(400).json({ message: "Message too long (max 500 chars)" });
+  if (!rateLimit(req.user.id, "clan_chat", 10, 60 * 1000))
+    return res.status(429).json({ message: "Sending too fast" });
+
+  const clan = await Clan.findById(req.params.clanId, { members: 1 });
+  if (!clan) return res.status(404).json({ message: "Clan not found" });
+  const member = clan.members.find(m => m.userId.equals(req.user.id));
+  if (!member) return res.status(403).json({ message: "Not a clan member" });
+
+  const msg = await ClanMessage.create({
+    clanId: req.params.clanId, fromId: req.user.id,
+    fromName: req.user.name, fromRole: member.role,
+    content: content.trim(),
+  });
+
+  // Push to all online clan members
+  clan.members.forEach(m => {
+    if (!m.userId.equals(req.user.id)) {
+      pushToUser(m.userId, { type: "clan_message_received", payload: { message: msg } });
+    }
+  });
+
+  res.status(201).json({ message: msg });
+});
+
+// ─── Notifications ────────────────────────────────────────
+
+/**
+ * @swagger
+ * /notifications:
+ *   get:
+ *     summary: Get your notifications
+ *     tags: [Notifications]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: limit
+ *         schema: { type: integer, default: 30 }
+ *       - in: query
+ *         name: unreadOnly
+ *         schema: { type: boolean, default: false }
+ *     responses:
+ *       200: { description: Notifications list }
+ */
+app.get("/notifications", auth, async (req, res) => {
+  const limit      = Math.min(parseInt(req.query.limit) || 30, 100);
+  const unreadOnly = req.query.unreadOnly === "true";
+  const filter     = { userId: req.user.id };
+  if (unreadOnly) filter.readAt = null;
+
+  const [notifications, unreadCount] = await Promise.all([
+    Notification.find(filter).sort({ createdAt: -1 }).limit(limit),
+    Notification.countDocuments({ userId: req.user.id, readAt: null }),
+  ]);
+  res.json({ notifications, unreadCount });
+});
+
+/**
+ * @swagger
+ * /notifications/{notificationId}/read:
+ *   post:
+ *     summary: Mark a notification as read
+ *     tags: [Notifications]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: notificationId
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200: { description: Marked as read }
+ */
+app.post("/notifications/:notificationId/read", auth, async (req, res) => {
+  await Notification.findOneAndUpdate({ _id: req.params.notificationId, userId: req.user.id }, { readAt: new Date() });
+  res.json({ ok: true });
+});
+
+/**
+ * @swagger
+ * /notifications/read-all:
+ *   post:
+ *     summary: Mark all notifications as read
+ *     tags: [Notifications]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200: { description: All marked as read }
+ */
+app.post("/notifications/read-all", auth, async (req, res) => {
+  const result = await Notification.updateMany({ userId: req.user.id, readAt: null }, { readAt: new Date() });
+  res.json({ marked: result.modifiedCount });
+});
+
+/**
+ * @swagger
+ * /notifications/unread-count:
+ *   get:
+ *     summary: Get unread notification count (for navbar badge)
+ *     tags: [Notifications]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200: { description: Unread count }
+ */
+app.get("/notifications/unread-count", auth, async (req, res) => {
+  const count = await Notification.countDocuments({ userId: req.user.id, readAt: null });
+  res.json({ count });
+});
+
+// ─── Player Search ────────────────────────────────────────
+
+/**
+ * @swagger
+ * /players/search:
+ *   get:
+ *     summary: Search players by name (public)
+ *     tags: [Players]
+ *     parameters:
+ *       - in: query
+ *         name: q
+ *         required: true
+ *         schema: { type: string }
+ *         description: Partial name to search
+ *       - in: query
+ *         name: limit
+ *         schema: { type: integer, default: 10 }
+ *     responses:
+ *       200: { description: Matching players }
+ *       400: { description: q is required }
+ */
+app.get("/players/search", async (req, res) => {
+  const { q, limit = 10 } = req.query;
+  if (!q) return res.status(400).json({ message: "q is required" });
+  if (!rateLimit("global", "player_search", 30, 60 * 1000))
+    return res.status(429).json({ message: "Search rate limit exceeded" });
+
+  const users = await User.find(
+    { name: { $regex: q, $options: "i" } },
+    { name: 1, level: 1, clanId: 1, onlineAt: 1 }
+  ).limit(Math.min(parseInt(limit), 20));
+
+  const players = await Promise.all(users.map(async u => {
+    let clanTag = null;
+    if (u.clanId) {
+      const c = await Clan.findById(u.clanId, { tag: 1 });
+      if (c) clanTag = c.tag;
+    }
+    return { name: u.name, account: { level: u.level }, clanTag, isOnline: isUserOnline(u.onlineAt) };
+  }));
+
+  res.json({ players });
+});
+
 // ─── Health ───────────────────────────────────────────────
 
 app.get("/", (req, res) => {
@@ -1386,6 +2867,6 @@ app.get("/", (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, "0.0.0.0", () => {
+server.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on http://localhost:${PORT}`);
 });
