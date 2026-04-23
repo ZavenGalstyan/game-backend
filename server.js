@@ -2860,6 +2860,36 @@ app.get("/players/search", async (req, res) => {
   res.json({ players });
 });
 
+// ─── Online Players ───────────────────────────────────────
+
+/**
+ * @swagger
+ * /players/online:
+ *   get:
+ *     summary: Get the number of currently online players (no auth required)
+ *     tags: [Players]
+ *     responses:
+ *       200:
+ *         description: Online player count
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 online:
+ *                   type: integer
+ *                   example: 42
+ *                 since:
+ *                   type: string
+ *                   format: date-time
+ *                   description: Cutoff timestamp (players active after this are considered online)
+ */
+app.get("/players/online", async (req, res) => {
+  const cutoff = new Date(Date.now() - 2 * 60 * 1000);
+  const online = await User.countDocuments({ onlineAt: { $gte: cutoff } });
+  res.json({ online, since: cutoff.toISOString() });
+});
+
 // ─── Health ───────────────────────────────────────────────
 
 app.get("/", (req, res) => {
