@@ -375,8 +375,9 @@ const RoomSchema = new mongoose.Schema({
 const Room = mongoose.model("Room", RoomSchema);
 
 // In-memory room relay — avoids DB on every position update
-const roomMembers = new Map(); // roomId → Set<userId>
-const userRoom    = new Map(); // userId → roomId
+const roomMembers      = new Map(); // roomId → Set<userId>
+const userRoom         = new Map(); // userId → roomId
+const disconnectTimers = new Map(); // userId → { timer, roomId } — grace period on page navigation
 
 // ─── Auth Middleware ───────────────────────────────────────
 
@@ -430,6 +431,35 @@ wss.on("connection", async (ws, req) => {
 
       if (msg.type === "ping")      return ws.send(JSON.stringify({ type: "pong" }));
       if (msg.type === "heartbeat") return User.findByIdAndUpdate(userId, { onlineAt: new Date() });
+
+      // ── Rejoin after page navigation ───────────────────────
+      if (msg.type === "room:rejoin") {
+        const { roomId: rejoinRoomId } = payload;
+        if (!rejoinRoomId) return;
+
+        // Cancel pending removal timer from page-navigate disconnect
+        const pending = disconnectTimers.get(userId);
+        if (pending) {
+          clearTimeout(pending.timer);
+          disconnectTimers.delete(userId);
+        }
+
+        // Verify user is still in the room in DB
+        const room = await Room.findOne({ roomId: rejoinRoomId });
+        if (!room) return;
+        const member = room.players.find(p => p.userId === userId);
+        if (!member) return;
+
+        // Re-register in in-memory relay
+        joinRoomMemory(rejoinRoomId, userId);
+
+        // Send full room state so client can sync
+        ws.send(JSON.stringify({ type: "room:state", payload: { room } }));
+
+        // Notify roommates this player is back
+        pushToRoom(rejoinRoomId, { type: "room:player_rejoined", payload: { userId, username: member.username } }, userId);
+        return;
+      }
 
       // ── Hot-path relay (in-memory only, no DB) ─────────────
       const roomId = userRoom.get(userId);
@@ -505,22 +535,34 @@ wss.on("connection", async (ws, req) => {
     wsConnections.delete(userId);
     const roomId = leaveRoomMemory(userId);
     if (!roomId) return;
-    const room = await Room.findOneAndUpdate(
-      { roomId },
-      { $pull: { players: { userId } } },
-      { new: true }
-    );
-    if (!room) return;
-    if (room.players.length === 0) {
-      await Room.updateOne({ roomId }, { $set: { status: "finished" } });
-      return;
-    }
-    let newHostId = null;
-    if (room.hostId === userId) {
-      newHostId = room.players[0].userId;
-      await Room.updateOne({ roomId }, { $set: { hostId: newHostId } });
-    }
-    pushToRoom(roomId, { type: "room:player_left", payload: { userId, newHostId } });
+
+    // Give 15s grace period for page navigation (index.html → game.html)
+    // before actually removing the player from the room.
+    // If room:rejoin arrives within that window, the timer is cancelled.
+    const timer = setTimeout(async () => {
+      disconnectTimers.delete(userId);
+      const room = await Room.findOneAndUpdate(
+        { roomId },
+        { $pull: { players: { userId } } },
+        { new: true }
+      );
+      if (!room) return;
+      if (room.players.length === 0) {
+        await Room.updateOne({ roomId }, { $set: { status: "finished" } });
+        return;
+      }
+      let newHostId = null;
+      if (room.hostId === userId) {
+        newHostId = room.players[0].userId;
+        await Room.updateOne({ roomId }, { $set: { hostId: newHostId } });
+      }
+      pushToRoom(roomId, { type: "room:player_left", payload: { userId, newHostId } });
+    }, 15000);
+
+    disconnectTimers.set(userId, { timer, roomId });
+
+    // Immediately tell roommates this player's connection dropped
+    pushToRoom(roomId, { type: "room:player_disconnected", payload: { userId } });
   });
 });
 
