@@ -1,12 +1,13 @@
-const http      = require("http");
-const express   = require("express");
-const mongoose  = require("mongoose");
-const cors      = require("cors");
-const bcrypt    = require("bcrypt");
-const jwt       = require("jsonwebtoken");
-const WebSocket = require("ws");
+const http       = require("http");
+const express    = require("express");
+const mongoose   = require("mongoose");
+const cors       = require("cors");
+const bcrypt     = require("bcrypt");
+const jwt        = require("jsonwebtoken");
+const WebSocket  = require("ws");
 const swaggerUi   = require("swagger-ui-express");
 const swaggerJsdoc = require("swagger-jsdoc");
+const { randomUUID } = require("crypto");
 
 const app = express();
 const JWT_SECRET = process.env.JWT_SECRET || "your_secret_key_change_this_in_production";
@@ -340,6 +341,43 @@ const NotificationSchema = new mongoose.Schema({
 
 const Notification = mongoose.model("Notification", NotificationSchema);
 
+// ─── Room / Multiplayer ───────────────────────────────────
+
+const VALID_MAPS = [
+  "neon_city","galactica","wasteland","robot_city","campaign",
+  "survival","hardcore","blitz","siege","frozen_tundra",
+  "ocean_depths","metropolis","desert_sands","jungle","arena","zombie","lifemode",
+];
+
+const RoomPlayerSubSchema = new mongoose.Schema({
+  userId:   { type: String, required: true },
+  username: { type: String, required: true },
+  charId:   { type: String, required: true },
+  hp:       { type: Number, default: 100 },
+  maxHp:    { type: Number, default: 100 },
+  kills:    { type: Number, default: 0 },
+  money:    { type: Number, default: 0 },
+  state:    { type: String, default: "alive" },
+  ready:    { type: Boolean, default: false },
+}, { _id: false });
+
+const RoomSchema = new mongoose.Schema({
+  roomId:     { type: String, required: true, unique: true },
+  mapId:      { type: String, required: true },
+  hostId:     { type: String, required: true },
+  status:     { type: String, enum: ["waiting","ingame","finished"], default: "waiting" },
+  maxPlayers: { type: Number, default: 4 },
+  wave:       { type: Number, default: 0 },
+  players:    { type: [RoomPlayerSubSchema], default: [] },
+  createdAt:  { type: Date, default: Date.now, expires: 7200 },
+});
+
+const Room = mongoose.model("Room", RoomSchema);
+
+// In-memory room relay — avoids DB on every position update
+const roomMembers = new Map(); // roomId → Set<userId>
+const userRoom    = new Map(); // userId → roomId
+
 // ─── Auth Middleware ───────────────────────────────────────
 
 async function auth(req, res, next) {
@@ -387,14 +425,102 @@ wss.on("connection", async (ws, req) => {
 
   ws.on("message", async (raw) => {
     try {
-      const msg = JSON.parse(raw);
-      if (msg.type === "ping")       return ws.send(JSON.stringify({ type: "pong" }));
-      if (msg.type === "heartbeat")  return User.findByIdAndUpdate(userId, { onlineAt: new Date() });
+      const msg     = JSON.parse(raw);
+      const payload = msg.payload || {};
+
+      if (msg.type === "ping")      return ws.send(JSON.stringify({ type: "pong" }));
+      if (msg.type === "heartbeat") return User.findByIdAndUpdate(userId, { onlineAt: new Date() });
+
+      // ── Hot-path relay (in-memory only, no DB) ─────────────
+      const roomId = userRoom.get(userId);
+
+      if (msg.type === "player:pos") {
+        if (!roomId) return;
+        pushToRoom(roomId, { type: "remote:pos", payload: { userId, ...payload } }, userId);
+        return;
+      }
+      if (msg.type === "player:shoot") {
+        if (!roomId) return;
+        pushToRoom(roomId, { type: "remote:shoot", payload: { userId, ...payload } }, userId);
+        return;
+      }
+      if (msg.type === "player:action") {
+        if (!roomId) return;
+        pushToRoom(roomId, { type: "remote:action", payload: { userId, ...payload } }, userId);
+        return;
+      }
+
+      // ── State-changing room messages (touch DB) ────────────
+      if (msg.type === "player:dead") {
+        if (!roomId) return;
+        await Room.updateOne({ roomId, "players.userId": userId }, { $set: { "players.$.state": "dead" } });
+        pushToRoom(roomId, { type: "remote:dead", payload: { userId, killedBy: payload.killedBy } }, userId);
+        return;
+      }
+      if (msg.type === "player:revive") {
+        if (!roomId) return;
+        const targetId = payload.targetUserId;
+        if (!targetId) return;
+        await Room.updateOne({ roomId, "players.userId": targetId }, { $set: { "players.$.state": "alive", "players.$.hp": 50 } });
+        pushToRoom(roomId, { type: "remote:revive", payload: { userId: targetId } });
+        return;
+      }
+      if (msg.type === "room:ready") {
+        if (!roomId) return;
+        const room = await Room.findOneAndUpdate(
+          { roomId, "players.userId": userId },
+          { $set: { "players.$.ready": true } },
+          { new: true }
+        );
+        if (!room) return;
+        pushToRoom(roomId, { type: "room:player_ready", payload: { userId } });
+        const allReady = room.players.length >= 2 && room.players.every(p => p.ready);
+        if (allReady && room.status === "waiting") {
+          await Room.updateOne({ roomId }, { $set: { status: "ingame", wave: 1 } });
+          pushToRoom(roomId, { type: "room:start", payload: { roomId, mapId: room.mapId, wave: 1 } });
+        }
+        return;
+      }
+      if (msg.type === "room:wave_ack") {
+        if (!roomId) return;
+        const room = await Room.findOne({ roomId });
+        if (!room || room.hostId !== userId) return;
+        const nextWave = room.wave + 1;
+        await Room.updateOne({ roomId }, { $set: { wave: nextWave } });
+        pushToRoom(roomId, { type: "room:wave_start", payload: { roomId, wave: nextWave } });
+        return;
+      }
+      if (msg.type === "room:finished") {
+        if (!roomId) return;
+        const room = await Room.findOne({ roomId });
+        if (!room || room.hostId !== userId) return;
+        await Room.updateOne({ roomId }, { $set: { status: "finished" } });
+        pushToRoom(roomId, { type: "room:finished", payload: { roomId, stats: payload.stats || [] } });
+        return;
+      }
     } catch { /* ignore malformed */ }
   });
 
   ws.on("close", async () => {
     wsConnections.delete(userId);
+    const roomId = leaveRoomMemory(userId);
+    if (!roomId) return;
+    const room = await Room.findOneAndUpdate(
+      { roomId },
+      { $pull: { players: { userId } } },
+      { new: true }
+    );
+    if (!room) return;
+    if (room.players.length === 0) {
+      await Room.updateOne({ roomId }, { $set: { status: "finished" } });
+      return;
+    }
+    let newHostId = null;
+    if (room.hostId === userId) {
+      newHostId = room.players[0].userId;
+      await Room.updateOne({ roomId }, { $set: { hostId: newHostId } });
+    }
+    pushToRoom(roomId, { type: "room:player_left", payload: { userId, newHostId } });
   });
 });
 
@@ -402,6 +528,33 @@ wss.on("connection", async (ws, req) => {
 function pushToUser(userId, data) {
   const ws = wsConnections.get(userId.toString());
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(data));
+}
+
+function pushToRoom(roomId, data, excludeUserId = null) {
+  const members = roomMembers.get(roomId);
+  if (!members) return;
+  for (const uid of members) {
+    if (excludeUserId && uid === excludeUserId) continue;
+    pushToUser(uid, data);
+  }
+}
+
+function joinRoomMemory(roomId, userId) {
+  if (!roomMembers.has(roomId)) roomMembers.set(roomId, new Set());
+  roomMembers.get(roomId).add(userId);
+  userRoom.set(userId, roomId);
+}
+
+function leaveRoomMemory(userId) {
+  const roomId = userRoom.get(userId);
+  if (!roomId) return null;
+  userRoom.delete(userId);
+  const members = roomMembers.get(roomId);
+  if (members) {
+    members.delete(userId);
+    if (members.size === 0) roomMembers.delete(roomId);
+  }
+  return roomId;
 }
 
 // ─── Social Helpers ───────────────────────────────────────
@@ -2858,6 +3011,227 @@ app.get("/players/search", async (req, res) => {
   }));
 
   res.json({ players });
+});
+
+// ─── Rooms ────────────────────────────────────────────────
+
+/**
+ * @swagger
+ * /rooms:
+ *   get:
+ *     summary: List open rooms (lobby browser)
+ *     tags: [Rooms]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: mapId
+ *         schema: { type: string }
+ *         description: Filter by map
+ *     responses:
+ *       200: { description: Open rooms list }
+ */
+app.get("/rooms", auth, async (req, res) => {
+  const filter = { status: "waiting" };
+  if (req.query.mapId) filter.mapId = req.query.mapId;
+  const rooms = await Room.find(filter);
+  res.json({
+    rooms: rooms.map(r => ({
+      roomId:      r.roomId,
+      mapId:       r.mapId,
+      hostName:    r.players.find(p => p.userId === r.hostId)?.username || "Unknown",
+      playerCount: r.players.length,
+      maxPlayers:  r.maxPlayers,
+      status:      r.status,
+      createdAt:   r.createdAt,
+    })),
+  });
+});
+
+/**
+ * @swagger
+ * /rooms/create:
+ *   post:
+ *     summary: Create a multiplayer room
+ *     tags: [Rooms]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [mapId, charId]
+ *             properties:
+ *               mapId:       { type: string, example: neon_city }
+ *               charId:      { type: string, example: gangster }
+ *               maxPlayers:  { type: integer, example: 4 }
+ *     responses:
+ *       201: { description: Room created }
+ *       400: { description: Invalid map or already in a room }
+ */
+app.post("/rooms/create", auth, async (req, res) => {
+  const { mapId, charId, maxPlayers = 4 } = req.body;
+  if (!mapId || !charId) return res.status(400).json({ error: "MISSING_FIELDS" });
+  if (!VALID_MAPS.includes(mapId)) return res.status(400).json({ error: "INVALID_MAP" });
+
+  const alreadyIn = await Room.findOne({ "players.userId": req.user.id.toString(), status: { $in: ["waiting","ingame"] } });
+  if (alreadyIn) return res.status(400).json({ error: "ALREADY_IN_ROOM", message: "Leave your current room first" });
+
+  const user   = await User.findById(req.user.id, { name: 1 });
+  const roomId = randomUUID();
+  const room   = await Room.create({
+    roomId,
+    mapId,
+    hostId:     req.user.id.toString(),
+    maxPlayers: Math.min(4, Math.max(1, maxPlayers)),
+    players:    [{ userId: req.user.id.toString(), username: user.name, charId, hp: 100, maxHp: 100 }],
+  });
+
+  joinRoomMemory(roomId, req.user.id.toString());
+  res.status(201).json({ roomId, room });
+});
+
+/**
+ * @swagger
+ * /rooms/{roomId}/join:
+ *   post:
+ *     summary: Join an existing room
+ *     tags: [Rooms]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: roomId
+ *         required: true
+ *         schema: { type: string }
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [charId]
+ *             properties:
+ *               charId: { type: string, example: phantom }
+ *     responses:
+ *       200: { description: Joined room }
+ *       400: { description: Room full or already started }
+ *       404: { description: Room not found }
+ */
+app.post("/rooms/:roomId/join", auth, async (req, res) => {
+  const { charId } = req.body;
+  if (!charId) return res.status(400).json({ error: "MISSING_FIELDS" });
+
+  const room = await Room.findOne({ roomId: req.params.roomId });
+  if (!room)                                       return res.status(404).json({ error: "NOT_FOUND" });
+  if (room.status !== "waiting")                   return res.status(400).json({ error: "ALREADY_STARTED" });
+  if (room.players.length >= room.maxPlayers)      return res.status(400).json({ error: "ROOM_FULL" });
+  if (room.players.some(p => p.userId === req.user.id.toString()))
+                                                   return res.status(400).json({ error: "ALREADY_IN_ROOM" });
+
+  const user      = await User.findById(req.user.id, { name: 1 });
+  const newPlayer = { userId: req.user.id.toString(), username: user.name, charId, hp: 100, maxHp: 100 };
+
+  await Room.updateOne({ roomId: room.roomId }, { $push: { players: newPlayer } });
+  joinRoomMemory(room.roomId, req.user.id.toString());
+  pushToRoom(room.roomId, { type: "room:player_joined", payload: { player: newPlayer } }, req.user.id.toString());
+
+  const updated = await Room.findOne({ roomId: room.roomId });
+  res.json({ room: updated });
+});
+
+/**
+ * @swagger
+ * /rooms/{roomId}/leave:
+ *   post:
+ *     summary: Leave a room
+ *     tags: [Rooms]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: roomId
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200: { description: Left room }
+ *       404: { description: Room not found }
+ */
+app.post("/rooms/:roomId/leave", auth, async (req, res) => {
+  const uid  = req.user.id.toString();
+  const room = await Room.findOneAndUpdate(
+    { roomId: req.params.roomId },
+    { $pull: { players: { userId: uid } } },
+    { new: true }
+  );
+  if (!room) return res.status(404).json({ error: "NOT_FOUND" });
+  leaveRoomMemory(uid);
+
+  if (room.players.length === 0) {
+    await Room.updateOne({ roomId: room.roomId }, { $set: { status: "finished" } });
+  } else if (room.hostId === uid) {
+    const newHostId = room.players[0].userId;
+    await Room.updateOne({ roomId: room.roomId }, { $set: { hostId: newHostId } });
+    pushToRoom(room.roomId, { type: "room:player_left", payload: { userId: uid, newHostId } });
+  } else {
+    pushToRoom(room.roomId, { type: "room:player_left", payload: { userId: uid } });
+  }
+
+  res.json({ ok: true });
+});
+
+/**
+ * @swagger
+ * /rooms/{roomId}/start:
+ *   post:
+ *     summary: Force-start the room (host only, bypasses ready check)
+ *     tags: [Rooms]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: roomId
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200: { description: Game started }
+ *       403: { description: Not the host }
+ *       404: { description: Room not found }
+ */
+app.post("/rooms/:roomId/start", auth, async (req, res) => {
+  const room = await Room.findOne({ roomId: req.params.roomId });
+  if (!room)                             return res.status(404).json({ error: "NOT_FOUND" });
+  if (room.hostId !== req.user.id.toString()) return res.status(403).json({ error: "NOT_HOST" });
+  if (room.status !== "waiting")         return res.status(400).json({ error: "ALREADY_STARTED" });
+
+  await Room.updateOne({ roomId: room.roomId }, { $set: { status: "ingame", wave: 1 } });
+  pushToRoom(room.roomId, { type: "room:start", payload: { roomId: room.roomId, mapId: room.mapId, wave: 1 } });
+  res.json({ ok: true });
+});
+
+/**
+ * @swagger
+ * /rooms/{roomId}:
+ *   get:
+ *     summary: Get full room state
+ *     tags: [Rooms]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: roomId
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200: { description: Room state }
+ *       404: { description: Room not found }
+ */
+app.get("/rooms/:roomId", auth, async (req, res) => {
+  const room = await Room.findOne({ roomId: req.params.roomId });
+  if (!room) return res.status(404).json({ error: "NOT_FOUND" });
+  res.json({ room });
 });
 
 // ─── Online Players ───────────────────────────────────────
