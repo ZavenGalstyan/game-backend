@@ -424,6 +424,9 @@ wss.on("connection", async (ws, req) => {
   // Update online status on connect
   await User.findByIdAndUpdate(userId, { onlineAt: new Date() });
 
+  // Tell the client who they are
+  ws.send(JSON.stringify({ type: "connected", payload: { userId } }));
+
   ws.on("message", async (raw) => {
     try {
       const msg     = JSON.parse(raw);
