@@ -466,17 +466,17 @@ wss.on("connection", async (ws, req) => {
 
       if (msg.type === "player:pos") {
         if (!roomId) return;
-        pushToRoom(roomId, { type: "remote:pos", payload: { userId, ...payload } }, userId);
+        pushToRoom(roomId, { type: "remote:pos", payload: { ...payload, userId } }, userId);
         return;
       }
       if (msg.type === "player:shoot") {
         if (!roomId) return;
-        pushToRoom(roomId, { type: "remote:shoot", payload: { userId, ...payload } }, userId);
+        pushToRoom(roomId, { type: "remote:shoot", payload: { ...payload, userId } }, userId);
         return;
       }
       if (msg.type === "player:action") {
         if (!roomId) return;
-        pushToRoom(roomId, { type: "remote:action", payload: { userId, ...payload } }, userId);
+        pushToRoom(roomId, { type: "remote:action", payload: { ...payload, userId } }, userId);
         return;
       }
 
@@ -3181,7 +3181,7 @@ app.post("/rooms/:roomId/join", auth, async (req, res) => {
   pushToRoom(room.roomId, { type: "room:player_joined", payload: { player: newPlayer } }, req.user.id.toString());
 
   const updated = await Room.findOne({ roomId: room.roomId });
-  res.json({ room: updated });
+  res.json({ room: updated, userId: req.user.id.toString() });
 });
 
 /**
@@ -3249,7 +3249,9 @@ app.post("/rooms/:roomId/start", auth, async (req, res) => {
   if (room.status !== "waiting")         return res.status(400).json({ error: "ALREADY_STARTED" });
 
   await Room.updateOne({ roomId: room.roomId }, { $set: { status: "ingame", wave: 1 } });
-  pushToRoom(room.roomId, { type: "room:start", payload: { roomId: room.roomId, mapId: room.mapId, wave: 1 } });
+  const startMsg = { type: "room:start", payload: { roomId: room.roomId, mapId: room.mapId, wave: 1 } };
+  pushToRoom(room.roomId, startMsg);
+  pushToUser(req.user.id.toString(), startMsg); // ensure host gets it even if not in roomMembers after page nav
   res.json({ ok: true });
 });
 
