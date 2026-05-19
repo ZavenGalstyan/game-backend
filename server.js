@@ -483,6 +483,21 @@ wss.on("connection", async (ws, req) => {
         return;
       }
 
+      // ── Shared enemy events ────────────────────────────────
+      if (msg.type === "bot:spawn") {
+        if (!roomId) return;
+        // Only the host may broadcast spawns
+        const room = await Room.findOne({ roomId }, { hostId: 1 });
+        if (!room || room.hostId !== userId) return;
+        pushToRoom(roomId, { type: "bot:spawn", payload }, userId);
+        return;
+      }
+      if (msg.type === "bot:dead") {
+        if (!roomId) return;
+        pushToRoom(roomId, { type: "bot:dead", payload }, userId);
+        return;
+      }
+
       // ── State-changing room messages (touch DB) ────────────
       if (msg.type === "player:dead") {
         if (!roomId) return;
