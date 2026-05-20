@@ -265,6 +265,40 @@ Other clients receive (not echoed back to sender):
 
 ---
 
+### `bot:positions`  ← HOST client → server → non-host clients
+
+Host sends every ~500 ms with the current position and HP of every live bot.
+Non-host clients use this to keep their bots in sync with the host's simulation.
+Server validates sender is the host; non-host senders are silently ignored.
+
+Host sends:
+```json
+{
+  "type": "bot:positions",
+  "payload": {
+    "bots": [
+      { "id": "ab3f7c", "x": 1520, "y": 940, "hp": 80 },
+      { "id": "cd8a1b", "x": 880,  "y": 620, "hp": 45 }
+    ]
+  }
+}
+```
+
+Other clients receive (not echoed back to host):
+```json
+{
+  "type": "bot:positions",
+  "payload": {
+    "bots": [
+      { "id": "ab3f7c", "x": 1520, "y": 940, "hp": 80 },
+      { "id": "cd8a1b", "x": 880,  "y": 620, "hp": 45 }
+    ]
+  }
+}
+```
+
+---
+
 ## Wave progression (host only)
 
 ### `room:wave_ack`  ← HOST → server
@@ -305,3 +339,4 @@ Server responds with `room:wave_start` to **all** clients.
 | `player:revive` | update DB + relay | others: **`remote:revive`** |
 | `bot:spawn` *(host only)* | relay | others: **`bot:spawn`** |
 | `bot:dead` | relay | others: **`bot:dead`** |
+| `bot:positions` *(host only)* | relay | others: **`bot:positions`** |

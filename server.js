@@ -497,6 +497,13 @@ wss.on("connection", async (ws, req) => {
         pushToRoom(roomId, { type: "bot:dead", payload }, userId);
         return;
       }
+      if (msg.type === "bot:positions") {
+        if (!roomId) return;
+        const room = await Room.findOne({ roomId }, { hostId: 1 });
+        if (!room || room.hostId !== userId) return;
+        pushToRoom(roomId, { type: "bot:positions", payload }, userId);
+        return;
+      }
 
       // ── State-changing room messages (touch DB) ────────────
       if (msg.type === "player:dead") {
