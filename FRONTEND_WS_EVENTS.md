@@ -6,6 +6,42 @@ spec for the relay events).
 
 ---
 
+## Character ID mapping
+
+`playerCharacterId` is an integer 1–27.  Use it as `CONFIG.CHARACTERS[playerCharacterId - 1]`.
+
+| playerCharacterId | charId (string)  |
+|:-----------------:|------------------|
+| 1  | gangster       |
+| 2  | hacker         |
+| 3  | mercenary      |
+| 4  | ghost          |
+| 5  | engineer       |
+| 6  | sniper_elite   |
+| 7  | drone_pilot    |
+| 8  | chemist        |
+| 9  | cyber_ninja    |
+| 10 | cyber_wolf     |
+| 11 | neon_panther   |
+| 12 | mecha_bulldog  |
+| 13 | timebreaker    |
+| 14 | ai_avatar      |
+| 15 | overlord       |
+| 16 | electric_eel   |
+| 17 | medic          |
+| 18 | ronin          |
+| 19 | pyro           |
+| 20 | phantom        |
+| 21 | spider_drone   |
+| 22 | robo_hawk      |
+| 23 | nano_rat       |
+| 24 | mini_bee       |
+| 25 | tank_commander |
+| 26 | blade_dancer   |
+| 27 | frost_walker   |
+
+---
+
 ## Connection
 
 Connect with a JWT token as a query parameter:
@@ -46,7 +82,7 @@ Server responds to **sender** with `room:state` and broadcasts
 ---
 
 ### `room:state`  ← server → rejoining client
-Full room snapshot.  Every player object includes `charId`.
+Full room snapshot.  Every player object includes both `charId` and `playerCharacterId`.
 
 ```json
 {
@@ -58,8 +94,8 @@ Full room snapshot.  Every player object includes `charId`.
       "hostId": "abc123",
       "status": "waiting",
       "players": [
-        { "userId": "abc123", "username": "Zaven", "charId": "gangster", "hp": 120, "maxHp": 120 },
-        { "userId": "def456", "username": "Bob",   "charId": "hacker",   "hp": 80,  "maxHp": 80  }
+        { "userId": "abc123", "username": "Zaven", "charId": "gangster", "playerCharacterId": 1, "hp": 120, "maxHp": 120 },
+        { "userId": "def456", "username": "Bob",   "charId": "hacker",   "playerCharacterId": 2, "hp": 80,  "maxHp": 80  }
       ]
     }
   }
@@ -70,18 +106,20 @@ Full room snapshot.  Every player object includes `charId`.
 
 ### `room:player_joined`  ← server → all clients in room
 Sent when a new player joins via `POST /rooms/:id/join`.
-The `player` object **includes `charId`** — use this to render the remote player's character sprite.
+Includes `charId` (string) **and** `playerCharacterId` (integer 1–27).
+Use `playerCharacterId` to look up `CONFIG.CHARACTERS[playerCharacterId - 1]` and render the correct skin.
 
 ```json
 {
   "type": "room:player_joined",
   "payload": {
     "player": {
-      "userId":   "def456",
-      "username": "Bob",
-      "charId":   "hacker",
-      "hp":       80,
-      "maxHp":    80
+      "userId":            "def456",
+      "username":          "Bob",
+      "charId":            "hacker",
+      "playerCharacterId": 2,
+      "hp":                80,
+      "maxHp":             80
     }
   }
 }
@@ -91,7 +129,7 @@ The `player` object **includes `charId`** — use this to render the remote play
 
 ### `room:player_rejoined`  ← server → all OTHER clients
 ```json
-{ "type": "room:player_rejoined", "payload": { "userId": "abc123", "username": "Zaven" } }
+{ "type": "room:player_rejoined", "payload": { "userId": "abc123", "username": "Zaven", "playerCharacterId": 1 } }
 ```
 
 ### `room:player_disconnected`  ← server → all OTHER clients

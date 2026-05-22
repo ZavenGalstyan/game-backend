@@ -343,6 +343,15 @@ const Notification = mongoose.model("Notification", NotificationSchema);
 
 // ─── Room / Multiplayer ───────────────────────────────────
 
+const CHAR_ID_TO_NUMBER = {
+  gangster: 1, hacker: 2, mercenary: 3, ghost: 4, engineer: 5,
+  sniper_elite: 6, drone_pilot: 7, chemist: 8, cyber_ninja: 9, cyber_wolf: 10,
+  neon_panther: 11, mecha_bulldog: 12, timebreaker: 13, ai_avatar: 14, overlord: 15,
+  electric_eel: 16, medic: 17, ronin: 18, pyro: 19, phantom: 20,
+  spider_drone: 21, robo_hawk: 22, nano_rat: 23, mini_bee: 24, tank_commander: 25,
+  blade_dancer: 26, frost_walker: 27,
+};
+
 const VALID_MAPS = [
   "neon_city","galactica","wasteland","robot_city","campaign",
   "survival","hardcore","blitz","siege","frozen_tundra",
@@ -350,10 +359,11 @@ const VALID_MAPS = [
 ];
 
 const RoomPlayerSubSchema = new mongoose.Schema({
-  userId:   { type: String, required: true },
-  username: { type: String, required: true },
-  charId:   { type: String, required: true },
-  hp:       { type: Number, default: 100 },
+  userId:              { type: String, required: true },
+  username:            { type: String, required: true },
+  charId:              { type: String, required: true },
+  playerCharacterId:   { type: Number, required: true },
+  hp:                  { type: Number, default: 100 },
   maxHp:    { type: Number, default: 100 },
   kills:    { type: Number, default: 0 },
   money:    { type: Number, default: 0 },
@@ -460,7 +470,7 @@ wss.on("connection", async (ws, req) => {
         ws.send(JSON.stringify({ type: "room:state", payload: { room } }));
 
         // Notify roommates this player is back
-        pushToRoom(rejoinRoomId, { type: "room:player_rejoined", payload: { userId, username: member.username } }, userId);
+        pushToRoom(rejoinRoomId, { type: "room:player_rejoined", payload: { userId, username: member.username, playerCharacterId: member.playerCharacterId } }, userId);
         return;
       }
 
@@ -3153,7 +3163,7 @@ app.post("/rooms/create", auth, async (req, res) => {
     mapId,
     hostId:     req.user.id.toString(),
     maxPlayers: Math.min(4, Math.max(1, maxPlayers)),
-    players:    [{ userId: req.user.id.toString(), username: user.name, charId, hp: 100, maxHp: 100 }],
+    players:    [{ userId: req.user.id.toString(), username: user.name, charId, playerCharacterId: CHAR_ID_TO_NUMBER[charId] ?? 1, hp: 100, maxHp: 100 }],
   });
 
   joinRoomMemory(roomId, req.user.id.toString());
@@ -3199,7 +3209,7 @@ app.post("/rooms/:roomId/join", auth, async (req, res) => {
                                                    return res.status(400).json({ error: "ALREADY_IN_ROOM" });
 
   const user      = await User.findById(req.user.id, { name: 1 });
-  const newPlayer = { userId: req.user.id.toString(), username: user.name, charId, hp: 100, maxHp: 100 };
+  const newPlayer = { userId: req.user.id.toString(), username: user.name, charId, playerCharacterId: CHAR_ID_TO_NUMBER[charId] ?? 1, hp: 100, maxHp: 100 };
 
   await Room.updateOne({ roomId: room.roomId }, { $push: { players: newPlayer } });
   joinRoomMemory(room.roomId, req.user.id.toString());
