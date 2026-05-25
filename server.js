@@ -341,6 +341,15 @@ const NotificationSchema = new mongoose.Schema({
 
 const Notification = mongoose.model("Notification", NotificationSchema);
 
+const ReportSchema = new mongoose.Schema({
+  reporterName:  { type: String, required: true },
+  reportedName:  { type: String, required: true },
+  reason:        { type: String, required: true, maxlength: 1000 },
+  status:        { type: String, enum: ["open", "reviewed", "dismissed"], default: "open" },
+}, { timestamps: true });
+
+const Report = mongoose.model("Report", ReportSchema);
+
 // ─── Room / Multiplayer ───────────────────────────────────
 
 const CHAR_ID_TO_NUMBER = {
@@ -3341,6 +3350,88 @@ app.get("/players/online", async (req, res) => {
   const cutoff = new Date(Date.now() - 2 * 60 * 1000);
   const online = await User.countDocuments({ onlineAt: { $gte: cutoff } });
   res.json({ online, since: cutoff.toISOString() });
+});
+
+// ─── Reports ─────────────────────────────────────────────
+
+/**
+ * @swagger
+ * /reports:
+ *   post:
+ *     summary: Submit a player report
+ *     tags: [Reports]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [reportedName, reason]
+ *             properties:
+ *               reportedName: { type: string, example: BadPlayer99 }
+ *               reason:       { type: string, example: "Cheating and harassment" }
+ *     responses:
+ *       201: { description: Report submitted }
+ *       400: { description: Missing fields or reporting yourself }
+ *       404: { description: Reported player not found }
+ */
+app.post("/reports", auth, async (req, res) => {
+  const { reportedName, reason } = req.body;
+  if (!reportedName || !reason) return res.status(400).json({ error: "MISSING_FIELDS" });
+
+  const reporter = await User.findById(req.user.id, { name: 1 });
+  if (reporter.name.toLowerCase() === reportedName.toLowerCase())
+    return res.status(400).json({ error: "CANNOT_REPORT_SELF" });
+
+  const reported = await User.findOne({ name: { $regex: new RegExp(`^${reportedName}$`, "i") } }, { name: 1 });
+  if (!reported) return res.status(404).json({ error: "USER_NOT_FOUND" });
+
+  const report = await Report.create({
+    reporterName: reporter.name,
+    reportedName: reported.name,
+    reason,
+  });
+
+  res.status(201).json({ message: "Report submitted", reportId: report._id });
+});
+
+/**
+ * @swagger
+ * /reports:
+ *   get:
+ *     summary: Get all player reports
+ *     tags: [Reports]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: status
+ *         schema: { type: string, enum: [open, reviewed, dismissed] }
+ *         description: Filter by status (default: all)
+ *       - in: query
+ *         name: limit
+ *         schema: { type: integer, default: 50 }
+ *       - in: query
+ *         name: skip
+ *         schema: { type: integer, default: 0 }
+ *     responses:
+ *       200: { description: List of reports }
+ */
+app.get("/reports", auth, async (req, res) => {
+  const filter = {};
+  if (req.query.status) filter.status = req.query.status;
+
+  const limit = Math.min(100, parseInt(req.query.limit) || 50);
+  const skip  = parseInt(req.query.skip) || 0;
+
+  const [reports, total] = await Promise.all([
+    Report.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
+    Report.countDocuments(filter),
+  ]);
+
+  res.json({ total, reports });
 });
 
 // ─── Health ───────────────────────────────────────────────
