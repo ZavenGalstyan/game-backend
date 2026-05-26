@@ -3376,6 +3376,24 @@ app.get("/players/online", async (req, res) => {
  *       201: { description: Report submitted }
  *       400: { description: Missing fields or reporting yourself }
  *       404: { description: Reported player not found }
+ *   get:
+ *     summary: Get all player reports
+ *     tags: [Reports]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: status
+ *         schema: { type: string, enum: [open, reviewed, dismissed] }
+ *         description: Filter by status (omit for all)
+ *       - in: query
+ *         name: limit
+ *         schema: { type: integer, default: 50 }
+ *       - in: query
+ *         name: skip
+ *         schema: { type: integer, default: 0 }
+ *     responses:
+ *       200: { description: List of reports }
  */
 app.post("/reports", auth, async (req, res) => {
   const { reportedName, reason } = req.body;
@@ -3397,28 +3415,6 @@ app.post("/reports", auth, async (req, res) => {
   res.status(201).json({ message: "Report submitted", reportId: report._id });
 });
 
-/**
- * @swagger
- * /reports:
- *   get:
- *     summary: Get all player reports
- *     tags: [Reports]
- *     security:
- *       - bearerAuth: []
- *     parameters:
- *       - in: query
- *         name: status
- *         schema: { type: string, enum: [open, reviewed, dismissed] }
- *         description: Filter by status (default: all)
- *       - in: query
- *         name: limit
- *         schema: { type: integer, default: 50 }
- *       - in: query
- *         name: skip
- *         schema: { type: integer, default: 0 }
- *     responses:
- *       200: { description: List of reports }
- */
 app.get("/reports", auth, async (req, res) => {
   const filter = {};
   if (req.query.status) filter.status = req.query.status;
@@ -3432,6 +3428,48 @@ app.get("/reports", auth, async (req, res) => {
   ]);
 
   res.json({ total, reports });
+});
+
+/**
+ * @swagger
+ * /reports/{id}/status:
+ *   patch:
+ *     summary: Update a report's status
+ *     tags: [Reports]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [status]
+ *             properties:
+ *               status: { type: string, enum: [open, reviewed, dismissed] }
+ *     responses:
+ *       200: { description: Status updated }
+ *       400: { description: Invalid status }
+ *       404: { description: Report not found }
+ */
+app.patch("/reports/:id/status", auth, async (req, res) => {
+  const { status } = req.body;
+  if (!["open", "reviewed", "dismissed"].includes(status))
+    return res.status(400).json({ error: "INVALID_STATUS", message: "Status must be open, reviewed, or dismissed" });
+
+  const report = await Report.findByIdAndUpdate(
+    req.params.id,
+    { $set: { status } },
+    { new: true }
+  );
+  if (!report) return res.status(404).json({ error: "NOT_FOUND" });
+
+  res.json({ message: "Status updated", report });
 });
 
 // ─── Health ───────────────────────────────────────────────
