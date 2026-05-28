@@ -350,6 +350,24 @@ const ReportSchema = new mongoose.Schema({
 
 const Report = mongoose.model("Report", ReportSchema);
 
+const ProposalSchema = new mongoose.Schema({
+  submitterName: { type: String, required: true },
+  title:         { type: String, required: true, maxlength: 200 },
+  description:   { type: String, required: true, maxlength: 2000 },
+  status:        { type: String, enum: ["open", "accepted", "rejected"], default: "open" },
+}, { timestamps: true });
+
+const Proposal = mongoose.model("Proposal", ProposalSchema);
+
+const ProblemSchema = new mongoose.Schema({
+  submitterName: { type: String, required: true },
+  title:         { type: String, required: true, maxlength: 200 },
+  description:   { type: String, required: true, maxlength: 2000 },
+  status:        { type: String, enum: ["open", "fixed", "dismissed"], default: "open" },
+}, { timestamps: true });
+
+const Problem = mongoose.model("Problem", ProblemSchema);
+
 // ─── Room / Multiplayer ───────────────────────────────────
 
 const CHAR_ID_TO_NUMBER = {
@@ -3470,6 +3488,252 @@ app.patch("/reports/:id/status", auth, async (req, res) => {
   if (!report) return res.status(404).json({ error: "NOT_FOUND" });
 
   res.json({ message: "Status updated", report });
+});
+
+// ─── Proposals ───────────────────────────────────────────
+
+/**
+ * @swagger
+ * /proposals:
+ *   post:
+ *     summary: Submit a proposal
+ *     tags: [Proposals]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [title, description]
+ *             properties:
+ *               title:       { type: string, example: "Add new map" }
+ *               description: { type: string, example: "I think we need a snow map with..." }
+ *     responses:
+ *       201: { description: Proposal submitted }
+ *       400: { description: Missing fields }
+ *   get:
+ *     summary: Get all proposals
+ *     tags: [Proposals]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: status
+ *         schema: { type: string, enum: [open, accepted, rejected] }
+ *       - in: query
+ *         name: limit
+ *         schema: { type: integer, default: 50 }
+ *       - in: query
+ *         name: skip
+ *         schema: { type: integer, default: 0 }
+ *     responses:
+ *       200: { description: List of proposals }
+ */
+app.post("/proposals", auth, async (req, res) => {
+  const { title, description } = req.body;
+  if (!title || !description) return res.status(400).json({ error: "MISSING_FIELDS" });
+
+  const user     = await User.findById(req.user.id, { name: 1 });
+  const proposal = await Proposal.create({ submitterName: user.name, title, description });
+  res.status(201).json({ message: "Proposal submitted", proposalId: proposal._id });
+});
+
+app.get("/proposals", auth, async (req, res) => {
+  const filter = {};
+  if (req.query.status) filter.status = req.query.status;
+  const limit = Math.min(100, parseInt(req.query.limit) || 50);
+  const skip  = parseInt(req.query.skip) || 0;
+
+  const [proposals, total] = await Promise.all([
+    Proposal.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
+    Proposal.countDocuments(filter),
+  ]);
+  res.json({ total, proposals });
+});
+
+/**
+ * @swagger
+ * /proposals/{id}/status:
+ *   patch:
+ *     summary: Update a proposal's status
+ *     tags: [Proposals]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [status]
+ *             properties:
+ *               status: { type: string, enum: [open, accepted, rejected] }
+ *     responses:
+ *       200: { description: Status updated }
+ *       400: { description: Invalid status }
+ *       404: { description: Proposal not found }
+ */
+app.patch("/proposals/:id/status", auth, async (req, res) => {
+  const { status } = req.body;
+  if (!["open", "accepted", "rejected"].includes(status))
+    return res.status(400).json({ error: "INVALID_STATUS", message: "Status must be open, accepted, or rejected" });
+
+  const proposal = await Proposal.findByIdAndUpdate(req.params.id, { $set: { status } }, { new: true });
+  if (!proposal) return res.status(404).json({ error: "NOT_FOUND" });
+  res.json({ message: "Status updated", proposal });
+});
+
+/**
+ * @swagger
+ * /proposals/{id}:
+ *   delete:
+ *     summary: Delete a proposal
+ *     tags: [Proposals]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200: { description: Proposal deleted }
+ *       404: { description: Proposal not found }
+ */
+app.delete("/proposals/:id", auth, async (req, res) => {
+  const proposal = await Proposal.findByIdAndDelete(req.params.id);
+  if (!proposal) return res.status(404).json({ error: "NOT_FOUND" });
+  res.json({ message: "Proposal deleted" });
+});
+
+// ─── Problems ─────────────────────────────────────────────
+
+/**
+ * @swagger
+ * /problems:
+ *   post:
+ *     summary: Submit a bug report / problem
+ *     tags: [Problems]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [title, description]
+ *             properties:
+ *               title:       { type: string, example: "Game crashes on wave 5" }
+ *               description: { type: string, example: "Every time I reach wave 5..." }
+ *     responses:
+ *       201: { description: Problem submitted }
+ *       400: { description: Missing fields }
+ *   get:
+ *     summary: Get all problems
+ *     tags: [Problems]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: status
+ *         schema: { type: string, enum: [open, fixed, dismissed] }
+ *       - in: query
+ *         name: limit
+ *         schema: { type: integer, default: 50 }
+ *       - in: query
+ *         name: skip
+ *         schema: { type: integer, default: 0 }
+ *     responses:
+ *       200: { description: List of problems }
+ */
+app.post("/problems", auth, async (req, res) => {
+  const { title, description } = req.body;
+  if (!title || !description) return res.status(400).json({ error: "MISSING_FIELDS" });
+
+  const user    = await User.findById(req.user.id, { name: 1 });
+  const problem = await Problem.create({ submitterName: user.name, title, description });
+  res.status(201).json({ message: "Problem submitted", problemId: problem._id });
+});
+
+app.get("/problems", auth, async (req, res) => {
+  const filter = {};
+  if (req.query.status) filter.status = req.query.status;
+  const limit = Math.min(100, parseInt(req.query.limit) || 50);
+  const skip  = parseInt(req.query.skip) || 0;
+
+  const [problems, total] = await Promise.all([
+    Problem.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
+    Problem.countDocuments(filter),
+  ]);
+  res.json({ total, problems });
+});
+
+/**
+ * @swagger
+ * /problems/{id}/status:
+ *   patch:
+ *     summary: Update a problem's status
+ *     tags: [Problems]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [status]
+ *             properties:
+ *               status: { type: string, enum: [open, fixed, dismissed] }
+ *     responses:
+ *       200: { description: Status updated }
+ *       400: { description: Invalid status }
+ *       404: { description: Problem not found }
+ */
+app.patch("/problems/:id/status", auth, async (req, res) => {
+  const { status } = req.body;
+  if (!["open", "fixed", "dismissed"].includes(status))
+    return res.status(400).json({ error: "INVALID_STATUS", message: "Status must be open, fixed, or dismissed" });
+
+  const problem = await Problem.findByIdAndUpdate(req.params.id, { $set: { status } }, { new: true });
+  if (!problem) return res.status(404).json({ error: "NOT_FOUND" });
+  res.json({ message: "Status updated", problem });
+});
+
+/**
+ * @swagger
+ * /problems/{id}:
+ *   delete:
+ *     summary: Delete a problem
+ *     tags: [Problems]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200: { description: Problem deleted }
+ *       404: { description: Problem not found }
+ */
+app.delete("/problems/:id", auth, async (req, res) => {
+  const problem = await Problem.findByIdAndDelete(req.params.id);
+  if (!problem) return res.status(404).json({ error: "NOT_FOUND" });
+  res.json({ message: "Problem deleted" });
 });
 
 // ─── Health ───────────────────────────────────────────────
